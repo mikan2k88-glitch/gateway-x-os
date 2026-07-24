@@ -34,30 +34,13 @@ Output ONLY a JSON string:
 }
 """
 
-def get_available_model():
-    """APIキーで利用可能な generateContent 対応モデルを自動検出"""
-    list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
-    req = urllib.request.Request(list_url)
-    try:
-        with urllib.request.urlopen(req) as res:
-            data = json.loads(res.read().decode('utf-8'))
-            for m in data.get('models', []):
-                methods = m.get('supportedGenerationMethods', [])
-                if 'generateContent' in methods:
-                    # 'models/gemini-xxx' からモデル名だけを取り出す
-                    return m['name'].replace('models/', '')
-    except Exception:
-        pass
-    return "gemini-1.5-flash"  # フォールバック
-
 @app.post("/v1/vetting")
 async def vet_agent_request(request: AgentRequest):
     if not API_KEY:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured.")
 
-    # 利用可能なモデル名を動的に取得
-    target_model = get_available_model()
-
+    # 最新標準モデル gemini-2.5-flash を指定
+    target_model = "gemini-2.5-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={API_KEY}"
     
     prompt_text = f"{SYSTEM_INSTRUCTION}\n\nAgent: {request.agent_id}\nQuery: {request.query}"
