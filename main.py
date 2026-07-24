@@ -34,54 +34,57 @@ Output ONLY a JSON string:
 }
 """
 
+# 利用可能なモデルの候補リスト（無料枠で使える順に試行）
+CANDIDATE_MODELS = [
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-flash-8b",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash"
+]
+
 @app.post("/v1/vetting")
 async def vet_agent_request(request: AgentRequest):
     if not API_KEY:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured.")
 
-    try:
-        # gemini-2.0-flash の REST エンドポイントを直接コール
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={API_KEY}"
-        
-        prompt_text = f"{SYSTEM_INSTRUCTION}\n\nAgent: {request.agent_id}\nQuery: {request.query}"
-        
-        payload = {
-            "contents": [
-                {
-                    "parts": [{"text": prompt_text}]
-                }
-            ]
-        }
-        
-        data = json.dumps(payload).encode('utf-8')
+    prompt_text = f"{SYSTEM_INSTRUCTION}\n\nAgent: {request.agent_id}\nQuery: {request.query}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt_text}]}]
+    }
+    data = json.dumps(payload).encode('utf-8')
+
+    last_error = ""
+
+    # 使えるモデルが見つかるまで順番にリクエスト
+    for model_name in CANDIDATE_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={API_KEY}"
         req = urllib.request.Request(
             url, 
             data=data, 
             headers={'Content-Type': 'application/json'}
         )
         
-        with urllib.request.urlopen(req) as res:
-            res_body = json.loads(res.read().decode('utf-8'))
-            text_response = res_body['candidates'][0]['content']['parts'][0]['text']
-            
-            return {
-                "gateway_execution_result": text_response
-            }
-            
-    except urllib.error.HTTPError as e:
-        error_response = e.read().decode('utf-8')
-        return {
-            "system_version": "4.3",
-            "request_id": f"XOS-{request.agent_id}-ERROR",
-            "status": "DECLINED",
-            "reason_code": "SYSTEM_ERROR",
-            "error_detail": f"HTTPError {e.code}: {error_response}"
-        }
-    except Exception as e:
-        return {
-            "system_version": "4.3",
-            "request_id": f"XOS-{request.agent_id}-ERROR",
-            "status": "DECLINED",
-            "reason_code": "SYSTEM_ERROR",
-            "error_detail": str(e)
-        }
+        try:
+            with urllib.request.urlopen(req) as res:
+                res_body = json.loads(res.read().decode('utf-8'))
+                text_response = res_body['candidates'][0]['content']['parts'][0]['text']
+                
+                return {
+                    "gateway_execution_result": text_response
+                }
+        except urllib.error.HTTPError as e:
+            err_msg = e.read().decode('utf-8')
+            last_error = f"[{model_name}] HTTP {e.code}: {err_msg}"
+            continue  # 次のモデルを試す
+        except Exception as e:
+            last_error = f"[{model_name}] {str(e)}"
+            continue
+
+    # すべての候補モデルで失敗した場合
+    return {
+        "system_version": "4.3",
+        "request_id": f"XOS-{request.agent_id}-ERROR",
+        "status": "DECLINED",
+        "reason_code": "SYSTEM_ERROR",
+        "error_detail": last_error
+    }
