@@ -40,9 +40,9 @@ async def vet_agent_request(request: AgentRequest):
     try:
         genai.configure(api_key=API_KEY)
         
-        # models/ プレフィックスを追加してモデルを呼び出し
+        # モデル名を最新安定版の gemini-2.0-flash に変更
         model = genai.GenerativeModel(
-            model_name="models/gemini-1.5-flash"
+            model_name="gemini-2.0-flash"
         )
         
         prompt = f"{SYSTEM_INSTRUCTION}\n\nAgent: {request.agent_id}\nQuery: {request.query}"
