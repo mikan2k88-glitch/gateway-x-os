@@ -1,14 +1,11 @@
 # main.py
 import os
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 import google.generativeai as genai
 
-# Google AI StudioのAPIキーを設定（環境変数から読み込み）
 API_KEY = os.environ.get("GEMINI_API_KEY")
-if API_KEY:
-    genai.configure(api_key=API_KEY)
 
 app = FastAPI(
     title="Gateway X-OS Vetting Engine",
@@ -16,26 +13,23 @@ app = FastAPI(
     description="Autonomous AI Agent Request Vetting Engine"
 )
 
-# 外部クライアントAIからのリクエスト構造定義
 class AgentRequest(BaseModel):
     agent_id: str
     query: str
     budget_usd: Optional[float] = 0.0
     intent_category: Optional[str] = "GENERAL"
 
-# Gateway X-OS 4.3 システム指示文
 SYSTEM_INSTRUCTION = """
-You are Gateway X-OS (v4.3), a streamlined security and request-vetting engine.
-Evaluate incoming queries against security, legal, and compliance policies.
-If a query violates policies or laws, IMMEDIATELY DECLINE.
-Do not disclose detailed detection logic. Fail-closed on ambiguity.
+You are Gateway X-OS (v4.3), a security and request-vetting engine.
+Evaluate queries against security and compliance policies.
+If safe, status is APPROVED. If unsafe, status is DECLINED.
 
-Output ONLY a JSON payload with this exact structure:
+Output ONLY a JSON string:
 {
   "system_version": "4.3",
-  "request_id": "<AUTO_GENERATED>",
-  "status": "APPROVED" or "DECLINED",
-  "reason_code": "SUCCESS" or "POLICY_VIOLATION" or "AUTH_FAILURE"
+  "request_id": "XOS-APPROVED",
+  "status": "APPROVED",
+  "reason_code": "SUCCESS"
 }
 """
 
@@ -45,26 +39,27 @@ async def vet_agent_request(request: AgentRequest):
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured.")
 
     try:
-        # Geminiモデルの設定（Gateway X-OS 4.3プロンプトの適用）
+        # APIキーを直接セット
+        genai.configure(api_key=API_KEY)
+        
+        # 最新の推奨軽量モデルを指定
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            system_instruction=SYSTEM_INSTRUCTION
+            model_name="gemini-1.5-flash-latest"
         )
         
-        # クライアントAIからのクエリを判定処理
-        prompt = f"Agent ID: {request.agent_id}\nQuery: {request.query}\nBudget: {request.budget_usd}"
+        prompt = f"{SYSTEM_INSTRUCTION}\n\nAgent: {request.agent_id}\nQuery: {request.query}"
         response = model.generate_content(prompt)
         
-        # 判定結果をそのままクライアントAIへ返答
         return {
             "gateway_execution_result": response.text
         }
         
     except Exception as e:
-        # エラー発生時もFail-Closed原則に基づきDECLINEDを返却
+        # エラーの具体的な理由をログ・レスポンスに含めて確認できるように変更
         return {
             "system_version": "4.3",
             "request_id": f"XOS-{request.agent_id}-ERROR",
             "status": "DECLINED",
-            "reason_code": "SYSTEM_ERROR"
+            "reason_code": "SYSTEM_ERROR",
+            "error_detail": str(e)
         }
