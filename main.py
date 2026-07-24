@@ -1,4 +1,3 @@
-# main.py
 import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -39,12 +38,11 @@ async def vet_agent_request(request: AgentRequest):
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured.")
 
     try:
-        # APIキーを直接セット
         genai.configure(api_key=API_KEY)
         
-        # 最新の推奨軽量モデルを指定
+        # モデル名を標準の gemini-1.5-flash に指定
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash-latest"
+            model_name="gemini-1.5-flash"
         )
         
         prompt = f"{SYSTEM_INSTRUCTION}\n\nAgent: {request.agent_id}\nQuery: {request.query}"
@@ -55,7 +53,6 @@ async def vet_agent_request(request: AgentRequest):
         }
         
     except Exception as e:
-        # エラーの具体的な理由をログ・レスポンスに含めて確認できるように変更
         return {
             "system_version": "4.3",
             "request_id": f"XOS-{request.agent_id}-ERROR",
