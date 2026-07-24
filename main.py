@@ -1,13 +1,12 @@
 import os
+import json
+import urllib.request
+import urllib.error
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-import google.generativeai as genai
 
-# アプリ起動時にAPIキーを設定
 API_KEY = os.environ.get("GEMINI_API_KEY")
-if API_KEY:
-    genai.configure(api_key=API_KEY)
 
 app = FastAPI(
     title="Gateway X-OS Vetting Engine",
@@ -41,18 +40,43 @@ async def vet_agent_request(request: AgentRequest):
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured.")
 
     try:
-        # 無料枠で確実に利用可能な gemini-1.5-flash を指定
-        model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash"
-        )
+        # API エンドポイントへ直接 REST リクエストを送信
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
         
-        prompt = f"{SYSTEM_INSTRUCTION}\n\nAgent: {request.agent_id}\nQuery: {request.query}"
-        response = model.generate_content(prompt)
+        prompt_text = f"{SYSTEM_INSTRUCTION}\n\nAgent: {request.agent_id}\nQuery: {request.query}"
         
-        return {
-            "gateway_execution_result": response.text
+        payload = {
+            "contents": [
+                {
+                    "parts": [{"text": prompt_text}]
+                }
+            ]
         }
         
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
+            url, 
+            data=data, 
+            headers={'Content-Type': 'application/json'}
+        )
+        
+        with urllib.request.urlopen(req) as res:
+            res_body = json.loads(res.read().decode('utf-8'))
+            text_response = res_body['candidates'][0]['content']['parts'][0]['text']
+            
+            return {
+                "gateway_execution_result": text_response
+            }
+            
+    except urllib.error.HTTPError as e:
+        error_response = e.read().decode('utf-8')
+        return {
+            "system_version": "4.3",
+            "request_id": f"XOS-{request.agent_id}-ERROR",
+            "status": "DECLINED",
+            "reason_code": "SYSTEM_ERROR",
+            "error_detail": f"HTTPError {e.code}: {error_response}"
+        }
     except Exception as e:
         return {
             "system_version": "4.3",
