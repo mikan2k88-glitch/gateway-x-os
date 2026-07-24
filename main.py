@@ -40,8 +40,8 @@ async def vet_agent_request(request: AgentRequest):
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured.")
 
     try:
-        # API エンドポイントへ直接 REST リクエストを送信
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
+        # gemini-2.0-flash の REST エンドポイントを直接コール
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={API_KEY}"
         
         prompt_text = f"{SYSTEM_INSTRUCTION}\n\nAgent: {request.agent_id}\nQuery: {request.query}"
         
