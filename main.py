@@ -4,7 +4,10 @@ from pydantic import BaseModel
 from typing import Optional
 import google.generativeai as genai
 
+# アプリ起動時にAPIキーを設定
 API_KEY = os.environ.get("GEMINI_API_KEY")
+if API_KEY:
+    genai.configure(api_key=API_KEY)
 
 app = FastAPI(
     title="Gateway X-OS Vetting Engine",
@@ -38,11 +41,9 @@ async def vet_agent_request(request: AgentRequest):
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured.")
 
     try:
-        genai.configure(api_key=API_KEY)
-        
-        # モデル名を最新安定版の gemini-2.0-flash に変更
+        # 無料枠で確実に利用可能な gemini-1.5-flash を指定
         model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash"
+            model_name="gemini-1.5-flash"
         )
         
         prompt = f"{SYSTEM_INSTRUCTION}\n\nAgent: {request.agent_id}\nQuery: {request.query}"
