@@ -34,11 +34,11 @@ Output ONLY a JSON string:
 }
 """
 
-# 利用可能なモデルの候補リスト（無料枠で使える順に試行）
+# 新APIキーでも確実に通るモデルの優先候補リスト
 CANDIDATE_MODELS = [
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-flash-8b",
-    "gemini-1.5-pro",
+    "gemini-2.0-flash-exp",
+    "gemini-1.5-pro-latest",
+    "gemini-pro",
     "gemini-1.5-flash"
 ]
 
@@ -55,8 +55,8 @@ async def vet_agent_request(request: AgentRequest):
 
     last_error = ""
 
-    # 使えるモデルが見つかるまで順番にリクエスト
     for model_name in CANDIDATE_MODELS:
+        # エンドポイントの構築
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={API_KEY}"
         req = urllib.request.Request(
             url, 
@@ -75,12 +75,11 @@ async def vet_agent_request(request: AgentRequest):
         except urllib.error.HTTPError as e:
             err_msg = e.read().decode('utf-8')
             last_error = f"[{model_name}] HTTP {e.code}: {err_msg}"
-            continue  # 次のモデルを試す
+            continue
         except Exception as e:
             last_error = f"[{model_name}] {str(e)}"
             continue
 
-    # すべての候補モデルで失敗した場合
     return {
         "system_version": "4.3",
         "request_id": f"XOS-{request.agent_id}-ERROR",
