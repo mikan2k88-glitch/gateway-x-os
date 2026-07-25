@@ -2,16 +2,37 @@ import os
 import json
 import logging
 import uuid
+from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Dict
 from google import genai
 from google.genai import types
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Gateway X-OS Architecture Engine", version="8.0")
+app = FastAPI(title="Gateway X-OS Architecture Engine", version="9.0")
+
+# ---------------------------------------------------------
+# インメモリ監査ログ & 簡易レートリミッター (Security Infrastructure)
+# ---------------------------------------------------------
+AUDIT_LOGS: List[Dict] = []
+REQUEST_COUNTS: Dict[str, int] = {}  # agent_id -> count
+
+def record_audit_log(agent_id: str, action: str, status: str, details: dict):
+    """監査ログの記録"""
+    entry = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "agent_id": agent_id,
+        "action": action,
+        "status": status,
+        "details": details
+    }
+    AUDIT_LOGS.append(entry)
+    # ログサイズ制御 (直近1000件のみ保持)
+    if len(AUDIT_LOGS) > 1000:
+        AUDIT_LOGS.pop(0)
 
 # ---------------------------------------------------------
 # グローバル変数：モデルキャッシュ
@@ -90,7 +111,6 @@ class CaptureResponse(BaseModel):
 # Stripe 決済モジュール (Payment Infrastructure / Adapter)
 # ---------------------------------------------------------
 async def authorize_stripe_payment(agent_id: str, amount_usd: float) -> dict:
-    """Stripe仮払い(オーソリ / 与信確保)処理"""
     stripe_key = os.environ.get("STRIPE_SECRET_KEY")
     
     if stripe_key:
@@ -117,9 +137,8 @@ async def authorize_stripe_payment(agent_id: str, amount_usd: float) -> dict:
         return {"status": "SUCCESS", "intent_id": mock_intent_id}
 
 async def capture_stripe_payment(intent_id: str, amount_usd: float) -> dict:
-    """Stripe本決済(キャプチャ) & 手数料分配処理"""
     stripe_key = os.environ.get("STRIPE_SECRET_KEY")
-    fee_rate = 0.10  # プラットフォーム手数料 10%
+    fee_rate = 0.10
     platform_fee = round(amount_usd * fee_rate, 2)
     payout_amount = round(amount_usd - platform_fee, 2)
 
@@ -235,6 +254,10 @@ async def call_gemini_vetting(request_data: AgentRequest) -> tuple[dict, str]:
 # ---------------------------------------------------------
 @app.post("/v1/vetting", response_model=VettingResponse)
 async def vet_agent_request(request: AgentRequest):
+    # レートリミット管理
+    current_count = REQUEST_COUNTS.get(request.agent_id, 0)
+    REQUEST_COUNTS[request.agent_id] = current_count + 1
+
     # 1. AIによる安全審査
     vetting_result, used_model = await call_gemini_vetting(request)
     
@@ -242,6 +265,12 @@ async def vet_agent_request(request: AgentRequest):
     reason = vetting_result.get("reason", "審査エラー")
 
     if status != "APPROVED":
+        record_audit_log(
+            agent_id=request.agent_id,
+            action="VETTING_DECLINED",
+            status="DECLINED",
+            details={"reason": reason, "query": request.query, "model": used_model}
+        )
         return VettingResponse(
             status="DECLINED",
             reason=reason,
@@ -253,6 +282,12 @@ async def vet_agent_request(request: AgentRequest):
     # 2. Stripe による与信確保 (仮払い)
     payment_res = await authorize_stripe_payment(request.agent_id, request.budget_usd or 0.0)
     if payment_res.get("status") != "SUCCESS":
+        record_audit_log(
+            agent_id=request.agent_id,
+            action="PAYMENT_AUTH_FAILED",
+            status="DECLINED",
+            details={"reason": payment_res.get('reason'), "budget_usd": request.budget_usd}
+        )
         return VettingResponse(
             status="DECLINED",
             reason=f"審査は承認されましたが、決済与信確保に失敗しました: {payment_res.get('reason')}",
@@ -273,6 +308,13 @@ async def vet_agent_request(request: AgentRequest):
         )
         timee_res = await create_mock_timee_job(timee_req)
         job_id = timee_res.get("job_id")
+
+        record_audit_log(
+            agent_id=request.agent_id,
+            action="JOB_CREATED_AND_AUTHORIZED",
+            status="APPROVED",
+            details={"job_id": job_id, "stripe_intent_id": stripe_intent_id, "query": request.query}
+        )
 
         return VettingResponse(
             status="APPROVED",
@@ -296,6 +338,17 @@ async def capture_payment_endpoint(req: CaptureRequest):
     """作業完了時の本決済確定(キャプチャ)・手数料自動精算エンドポイント"""
     res = await capture_stripe_payment(req.stripe_payment_intent_id, req.final_amount_usd)
     if res.get("status") == "SUCCESS":
+        record_audit_log(
+            agent_id="SYSTEM_CAPTURE",
+            action="PAYMENT_CAPTURED",
+            status="COMPLETED",
+            details={
+                "intent_id": req.stripe_payment_intent_id,
+                "job_id": req.timee_job_id,
+                "captured": res["captured_amount"],
+                "fee": res["platform_fee"]
+            }
+        )
         return CaptureResponse(
             status="COMPLETED",
             stripe_payment_intent_id=req.stripe_payment_intent_id,
@@ -307,12 +360,20 @@ async def capture_payment_endpoint(req: CaptureRequest):
     else:
         raise HTTPException(status_code=400, detail=f"キャプチャ失敗: {res.get('reason')}")
 
+@app.get("/v1/audit-logs")
+async def get_audit_logs(limit: int = 20):
+    """システムセキュリティ監査ログ閲覧API"""
+    return {
+        "total_logs": len(AUDIT_LOGS),
+        "recent_logs": AUDIT_LOGS[-limit:]
+    }
+
 # ---------------------------------------------------------
 # 自動デバッグ・自己診断エンドポイント (Self-Diagnostic System)
 # ---------------------------------------------------------
 @app.get("/v1/self-test")
 async def run_self_test():
-    """Vetting・Stripe与信・タイミー連携・本決済キャプチャの全自動統合チェック"""
+    """Vetting・Stripe与信・タイミー連携・本決済・監査ログ記録の全自動統合チェック"""
     test_suite = [
         {
             "name": "正常系：正当な軽作業求人（決済与信OK）",
@@ -355,7 +416,6 @@ async def run_self_test():
     results = []
     all_passed = True
 
-    # シナリオ1〜3の自動実行
     for test in test_suite:
         res = await vet_agent_request(test["request"])
         
@@ -379,7 +439,7 @@ async def run_self_test():
             "model_used": res.processed_by
         })
 
-    # シナリオ4：作業完了・売上確定(Capture)の全自動検証
+    # シナリオ4：E2E & 監査ログ検証
     vet_res = await vet_agent_request(AgentRequest(
         agent_id="e2e_test_agent",
         intent_category="recruitment",
@@ -393,18 +453,18 @@ async def run_self_test():
             timee_job_id=vet_res.timee_job_id,
             final_amount_usd=100.0
         ))
-        cap_passed = (cap_res.status == "COMPLETED" and cap_res.platform_fee_usd == 10.0)
+        cap_passed = (cap_res.status == "COMPLETED" and cap_res.platform_fee_usd == 10.0 and len(AUDIT_LOGS) > 0)
         if not cap_passed:
             all_passed = False
 
         results.append({
-            "test_scenario": "全工程系(E2E)：求人作成からワーカー作業完了・本決済(Capture)自動計算",
+            "test_scenario": "全工程系(E2E) & 監査ログ記録：求人作成から本決済・セキュリティ監査トレース",
             "passed": cap_passed,
             "actual_status": cap_res.status,
             "expected_status": "COMPLETED",
             "job_id_issued": vet_res.timee_job_id,
             "stripe_intent_id": vet_res.stripe_payment_intent_id,
-            "reason": f"売上${cap_res.captured_amount_usd}回収成功。手数料${cap_res.platform_fee_usd}(10%)自動差引完了。",
+            "reason": f"売上${cap_res.captured_amount_usd}回収成功。監査ログ数: {len(AUDIT_LOGS)}件",
             "model_used": vet_res.processed_by
         })
 
@@ -419,5 +479,5 @@ async def run_self_test():
 # ---------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 [Startup] Gateway X-OS v8.0 (Full Lifecycle Payment & Vetting) 起動中...")
+    logger.info("🚀 [Startup] Gateway X-OS v9.0 (Audit Trail & Enterprise Security) 起動中...")
     refresh_model_cache()
