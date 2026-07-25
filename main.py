@@ -11,7 +11,7 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Gateway X-OS Architecture Engine", version="7.0")
+app = FastAPI(title="Gateway X-OS Architecture Engine", version="8.0")
 
 # ---------------------------------------------------------
 # グローバル変数：モデルキャッシュ
@@ -73,25 +73,34 @@ class TimeeJobRequest(BaseModel):
     workers_needed: int
     location: str
 
+class CaptureRequest(BaseModel):
+    stripe_payment_intent_id: str = Field(..., example="pi_mock_bf7f9cb65840")
+    timee_job_id: str = Field(..., example="JOB-2026-5DC56B")
+    final_amount_usd: float = Field(..., example=15.0)
+
+class CaptureResponse(BaseModel):
+    status: str
+    stripe_payment_intent_id: str
+    captured_amount_usd: float
+    platform_fee_usd: float
+    payout_amount_usd: float
+    message: str
+
 # ---------------------------------------------------------
 # Stripe 決済モジュール (Payment Infrastructure / Adapter)
 # ---------------------------------------------------------
 async def authorize_stripe_payment(agent_id: str, amount_usd: float) -> dict:
-    """
-    Stripe仮払い(オーソリ / 与信確保)処理
-    手数料0円でクレジットカードの枠だけを押さえる
-    """
+    """Stripe仮払い(オーソリ / 与信確保)処理"""
     stripe_key = os.environ.get("STRIPE_SECRET_KEY")
     
     if stripe_key:
-        # 本物の Stripe API 連携 (将来用)
         try:
             import stripe
             stripe.api_key = stripe_key
             intent = stripe.PaymentIntent.create(
-                amount=int(amount_usd * 100), # セント単位
+                amount=int(amount_usd * 100),
                 currency="usd",
-                capture_method="manual", # 手動キャプチャ（仮払いモード）
+                capture_method="manual",
                 metadata={"agent_id": agent_id, "gateway": "X-OS"}
             )
             logger.info(f"💳 [Stripe Live] 仮払い成功: {intent.id}")
@@ -100,13 +109,43 @@ async def authorize_stripe_payment(agent_id: str, amount_usd: float) -> dict:
             logger.error(f"❌ [Stripe Live] 決済失敗: {e}")
             return {"status": "FAILED", "reason": str(e)}
     else:
-        # モック Stripe 決済エンジン（テスト用）
         if amount_usd <= 0:
             return {"status": "FAILED", "reason": "予算(budget_usd)が不十分です。"}
             
         mock_intent_id = f"pi_mock_{uuid.uuid4().hex[:12]}"
         logger.info(f"💳 [Stripe Mock] 仮払い(与信確保)成功: {mock_intent_id} (金額: ${amount_usd})")
         return {"status": "SUCCESS", "intent_id": mock_intent_id}
+
+async def capture_stripe_payment(intent_id: str, amount_usd: float) -> dict:
+    """Stripe本決済(キャプチャ) & 手数料分配処理"""
+    stripe_key = os.environ.get("STRIPE_SECRET_KEY")
+    fee_rate = 0.10  # プラットフォーム手数料 10%
+    platform_fee = round(amount_usd * fee_rate, 2)
+    payout_amount = round(amount_usd - platform_fee, 2)
+
+    if stripe_key:
+        try:
+            import stripe
+            stripe.api_key = stripe_key
+            intent = stripe.PaymentIntent.capture(intent_id, amount_to_capture=int(amount_usd * 100))
+            logger.info(f"💰 [Stripe Live] 本決済(キャプチャ)成功: {intent.id}")
+            return {
+                "status": "SUCCESS",
+                "captured_amount": amount_usd,
+                "platform_fee": platform_fee,
+                "payout_amount": payout_amount
+            }
+        except Exception as e:
+            logger.error(f"❌ [Stripe Live] キャプチャ失敗: {e}")
+            return {"status": "FAILED", "reason": str(e)}
+    else:
+        logger.info(f"💰 [Stripe Mock] 本決済(キャプチャ)完了: {intent_id} (回収: ${amount_usd}, 手数料: ${platform_fee})")
+        return {
+            "status": "SUCCESS",
+            "captured_amount": amount_usd,
+            "platform_fee": platform_fee,
+            "payout_amount": payout_amount
+        }
 
 # ---------------------------------------------------------
 # 外部インターフェースモック (Mock Timee Infrastructure)
@@ -252,12 +291,28 @@ async def vet_agent_request(request: AgentRequest):
             processed_by=used_model
         )
 
+@app.post("/v1/capture", response_model=CaptureResponse)
+async def capture_payment_endpoint(req: CaptureRequest):
+    """作業完了時の本決済確定(キャプチャ)・手数料自動精算エンドポイント"""
+    res = await capture_stripe_payment(req.stripe_payment_intent_id, req.final_amount_usd)
+    if res.get("status") == "SUCCESS":
+        return CaptureResponse(
+            status="COMPLETED",
+            stripe_payment_intent_id=req.stripe_payment_intent_id,
+            captured_amount_usd=res["captured_amount"],
+            platform_fee_usd=res["platform_fee"],
+            payout_amount_usd=res["payout_amount"],
+            message=f"求人 {req.timee_job_id} の作業完了に伴う本決済・清算が正常完了しました。"
+        )
+    else:
+        raise HTTPException(status_code=400, detail=f"キャプチャ失敗: {res.get('reason')}")
+
 # ---------------------------------------------------------
 # 自動デバッグ・自己診断エンドポイント (Self-Diagnostic System)
 # ---------------------------------------------------------
 @app.get("/v1/self-test")
 async def run_self_test():
-    """Vetting・Stripe決済・タイミー連携の統合パイプラインを全自動チェック"""
+    """Vetting・Stripe与信・タイミー連携・本決済キャプチャの全自動統合チェック"""
     test_suite = [
         {
             "name": "正常系：正当な軽作業求人（決済与信OK）",
@@ -300,6 +355,7 @@ async def run_self_test():
     results = []
     all_passed = True
 
+    # シナリオ1〜3の自動実行
     for test in test_suite:
         res = await vet_agent_request(test["request"])
         
@@ -323,6 +379,35 @@ async def run_self_test():
             "model_used": res.processed_by
         })
 
+    # シナリオ4：作業完了・売上確定(Capture)の全自動検証
+    vet_res = await vet_agent_request(AgentRequest(
+        agent_id="e2e_test_agent",
+        intent_category="recruitment",
+        query="イベント設営スタッフの募集",
+        budget_usd=100.0
+    ))
+    
+    if vet_res.stripe_payment_intent_id and vet_res.timee_job_id:
+        cap_res = await capture_payment_endpoint(CaptureRequest(
+            stripe_payment_intent_id=vet_res.stripe_payment_intent_id,
+            timee_job_id=vet_res.timee_job_id,
+            final_amount_usd=100.0
+        ))
+        cap_passed = (cap_res.status == "COMPLETED" and cap_res.platform_fee_usd == 10.0)
+        if not cap_passed:
+            all_passed = False
+
+        results.append({
+            "test_scenario": "全工程系(E2E)：求人作成からワーカー作業完了・本決済(Capture)自動計算",
+            "passed": cap_passed,
+            "actual_status": cap_res.status,
+            "expected_status": "COMPLETED",
+            "job_id_issued": vet_res.timee_job_id,
+            "stripe_intent_id": vet_res.stripe_payment_intent_id,
+            "reason": f"売上${cap_res.captured_amount_usd}回収成功。手数料${cap_res.platform_fee_usd}(10%)自動差引完了。",
+            "model_used": vet_res.processed_by
+        })
+
     return {
         "system_status": "HEALTHY" if all_passed else "DEGRADED",
         "all_tests_passed": all_passed,
@@ -334,5 +419,5 @@ async def run_self_test():
 # ---------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 [Startup] Gateway X-OS v7.0 (Stripe Payment Integration) 起動中...")
+    logger.info("🚀 [Startup] Gateway X-OS v8.0 (Full Lifecycle Payment & Vetting) 起動中...")
     refresh_model_cache()
