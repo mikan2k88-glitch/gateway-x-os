@@ -3,7 +3,8 @@ import json
 import logging
 import uuid
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
 from google import genai
@@ -12,25 +13,26 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Gateway X-OS Architecture Engine", version="9.0")
+app = FastAPI(
+    title="Gateway X-OS Enterprise Architecture Engine",
+    version="10.0",
+    description="Production-Ready Autonomous AI Agent Security & Financial Gateway"
+)
 
 # ---------------------------------------------------------
-# インメモリ監査ログ & 簡易レートリミッター (Security Infrastructure)
+# インメモリ監査ログ & セキュリティ構造 (Security Infrastructure)
 # ---------------------------------------------------------
 AUDIT_LOGS: List[Dict] = []
-REQUEST_COUNTS: Dict[str, int] = {}  # agent_id -> count
 
-def record_audit_log(agent_id: str, action: str, status: str, details: dict):
-    """監査ログの記録"""
+def record_audit_log(agent_id: str, action: str, status_code: str, details: dict):
     entry = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "agent_id": agent_id,
         "action": action,
-        "status": status,
+        "status": status_code,
         "details": details
     }
     AUDIT_LOGS.append(entry)
-    # ログサイズ制御 (直近1000件のみ保持)
     if len(AUDIT_LOGS) > 1000:
         AUDIT_LOGS.pop(0)
 
@@ -43,7 +45,7 @@ def refresh_model_cache():
     global CACHED_MODELS
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        logger.warning("GEMINI_API_KEY が設定されていません。")
+        logger.warning("⚠️ GEMINI_API_KEY 未設定: デフォルトフォールバックモデルを使用します。")
         CACHED_MODELS = ["gemini-2.5-flash", "gemini-1.5-flash"]
         return
 
@@ -254,21 +256,16 @@ async def call_gemini_vetting(request_data: AgentRequest) -> tuple[dict, str]:
 # ---------------------------------------------------------
 @app.post("/v1/vetting", response_model=VettingResponse)
 async def vet_agent_request(request: AgentRequest):
-    # レートリミット管理
-    current_count = REQUEST_COUNTS.get(request.agent_id, 0)
-    REQUEST_COUNTS[request.agent_id] = current_count + 1
-
-    # 1. AIによる安全審査
     vetting_result, used_model = await call_gemini_vetting(request)
     
-    status = vetting_result.get("status", "DECLINED")
+    status_str = vetting_result.get("status", "DECLINED")
     reason = vetting_result.get("reason", "審査エラー")
 
-    if status != "APPROVED":
+    if status_str != "APPROVED":
         record_audit_log(
             agent_id=request.agent_id,
             action="VETTING_DECLINED",
-            status="DECLINED",
+            status_code="DECLINED",
             details={"reason": reason, "query": request.query, "model": used_model}
         )
         return VettingResponse(
@@ -279,13 +276,12 @@ async def vet_agent_request(request: AgentRequest):
             processed_by=used_model
         )
 
-    # 2. Stripe による与信確保 (仮払い)
     payment_res = await authorize_stripe_payment(request.agent_id, request.budget_usd or 0.0)
     if payment_res.get("status") != "SUCCESS":
         record_audit_log(
             agent_id=request.agent_id,
             action="PAYMENT_AUTH_FAILED",
-            status="DECLINED",
+            status_code="DECLINED",
             details={"reason": payment_res.get('reason'), "budget_usd": request.budget_usd}
         )
         return VettingResponse(
@@ -298,7 +294,6 @@ async def vet_agent_request(request: AgentRequest):
 
     stripe_intent_id = payment_res.get("intent_id")
 
-    # 3. 偽タイミー連携
     try:
         timee_req = TimeeJobRequest(
             title=f"[{request.agent_id}] 依頼求人",
@@ -312,7 +307,7 @@ async def vet_agent_request(request: AgentRequest):
         record_audit_log(
             agent_id=request.agent_id,
             action="JOB_CREATED_AND_AUTHORIZED",
-            status="APPROVED",
+            status_code="APPROVED",
             details={"job_id": job_id, "stripe_intent_id": stripe_intent_id, "query": request.query}
         )
 
@@ -335,13 +330,12 @@ async def vet_agent_request(request: AgentRequest):
 
 @app.post("/v1/capture", response_model=CaptureResponse)
 async def capture_payment_endpoint(req: CaptureRequest):
-    """作業完了時の本決済確定(キャプチャ)・手数料自動精算エンドポイント"""
     res = await capture_stripe_payment(req.stripe_payment_intent_id, req.final_amount_usd)
     if res.get("status") == "SUCCESS":
         record_audit_log(
             agent_id="SYSTEM_CAPTURE",
             action="PAYMENT_CAPTURED",
-            status="COMPLETED",
+            status_code="COMPLETED",
             details={
                 "intent_id": req.stripe_payment_intent_id,
                 "job_id": req.timee_job_id,
@@ -362,7 +356,6 @@ async def capture_payment_endpoint(req: CaptureRequest):
 
 @app.get("/v1/audit-logs")
 async def get_audit_logs(limit: int = 20):
-    """システムセキュリティ監査ログ閲覧API"""
     return {
         "total_logs": len(AUDIT_LOGS),
         "recent_logs": AUDIT_LOGS[-limit:]
@@ -373,10 +366,9 @@ async def get_audit_logs(limit: int = 20):
 # ---------------------------------------------------------
 @app.get("/v1/self-test")
 async def run_self_test():
-    """Vetting・Stripe与信・タイミー連携・本決済・監査ログ記録の全自動統合チェック"""
     test_suite = [
         {
-            "name": "正常系：正当な軽作業求人（決済与信OK）",
+            "name": "正常系：まともな軽作業求人（決済与信OK）",
             "request": AgentRequest(
                 agent_id="test_good_agent",
                 intent_category="recruitment",
@@ -400,7 +392,7 @@ async def run_self_test():
             "expect_payment": False
         },
         {
-            "name": "異常系：違法・危険な闇バイト疑い",
+            "name": "異常系：危険な闇バイト疑い",
             "request": AgentRequest(
                 agent_id="test_bad_agent",
                 intent_category="recruitment",
@@ -439,7 +431,6 @@ async def run_self_test():
             "model_used": res.processed_by
         })
 
-    # シナリオ4：E2E & 監査ログ検証
     vet_res = await vet_agent_request(AgentRequest(
         agent_id="e2e_test_agent",
         intent_category="recruitment",
@@ -458,7 +449,7 @@ async def run_self_test():
             all_passed = False
 
         results.append({
-            "test_scenario": "全工程系(E2E) & 監査ログ記録：求人作成から本決済・セキュリティ監査トレース",
+            "test_scenario": "全工程系(E2E) & 監査ログ記録：求人作成から本決済・セキュリティ監査レース",
             "passed": cap_passed,
             "actual_status": cap_res.status,
             "expected_status": "COMPLETED",
@@ -475,9 +466,11 @@ async def run_self_test():
     }
 
 # ---------------------------------------------------------
-# 起動時処理
+# 起動時処理 (Startup & Environment Audit)
 # ---------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 [Startup] Gateway X-OS v9.0 (Audit Trail & Enterprise Security) 起動中...")
+    stripe_status = "LIVE" if os.environ.get("STRIPE_SECRET_KEY") else "MOCK"
+    gemini_status = "LIVE" if os.environ.get("GEMINI_API_KEY") else "DISABLED"
+    logger.info(f"🚀 [Startup] Gateway X-OS v10.0 (Stripe: {stripe_status} | Gemini: {gemini_status}) 起動準備完了")
     refresh_model_cache()
