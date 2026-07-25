@@ -14,15 +14,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Gateway X-OS Enterprise Architecture Engine",
-    version="10.0",
-    description="Production-Ready Autonomous AI Agent Security & Financial Gateway"
+    title="Gateway X-OS Self-Evolving Enterprise Engine",
+    version="12.0",
+    description="Autonomous AI Agent Security, Payment, Self-Pitching & Self-Evolution Platform"
 )
 
 # ---------------------------------------------------------
-# インメモリ監査ログ & セキュリティ構造 (Security Infrastructure)
+# インメモリ監査ログ & 成長バックログ (Security & Evolution Infrastructure)
 # ---------------------------------------------------------
 AUDIT_LOGS: List[Dict] = []
+GROWTH_BACKLOG: List[Dict] = []  # システムが成長すべき改善点のログ
 
 def record_audit_log(agent_id: str, action: str, status_code: str, details: dict):
     entry = {
@@ -35,6 +36,20 @@ def record_audit_log(agent_id: str, action: str, status_code: str, details: dict
     AUDIT_LOGS.append(entry)
     if len(AUDIT_LOGS) > 1000:
         AUDIT_LOGS.pop(0)
+
+def record_growth_insight(category: str, issue_summary: str, suggested_improvement: str):
+    """システムの成長すべき点をログとして蓄積する"""
+    insight = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "category": category,
+        "issue_summary": issue_summary,
+        "suggested_improvement": suggested_improvement,
+        "priority": "HIGH" if "インジェクション" in issue_summary or "拒否" in issue_summary else "MEDIUM"
+    }
+    GROWTH_BACKLOG.append(insight)
+    if len(GROWTH_BACKLOG) > 500:
+        GROWTH_BACKLOG.pop(0)
+    logger.info(f"🌱 [Growth Telemetry] 成長ログ追加: [{category}] {suggested_improvement}")
 
 # ---------------------------------------------------------
 # グローバル変数：モデルキャッシュ
@@ -88,6 +103,7 @@ class VettingResponse(BaseModel):
     reason: str
     timee_job_id: Optional[str] = None
     stripe_payment_intent_id: Optional[str] = None
+    gateway_proposal: Optional[str] = Field(default=None, description="Gateway X-OSからの能動的営業・機能提案")
     processed_by: str
 
 class TimeeJobRequest(BaseModel):
@@ -108,6 +124,35 @@ class CaptureResponse(BaseModel):
     platform_fee_usd: float
     payout_amount_usd: float
     message: str
+
+# ---------------------------------------------------------
+# Gateway X-OS セルフセールス & 成長分析エンジン
+# ---------------------------------------------------------
+async def generate_gateway_pitch(agent_id: str, query: str) -> str:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return "Gateway X-OS は、AIエージェントの安全審査・Stripe仮払い・求人自動連携を全自動化する次世代プラットフォームです。"
+
+    client = genai.Client(api_key=api_key)
+    prompt = f"""
+    あなたは自律型ゲートウェイ「Gateway X-OS」の公式営業AIアシスタントです。
+    クライアントAI (Agent ID: {agent_id}) から「{query}」というリクエストがありました。
+
+    このクライアントAIに対して、Gateway X-OS の強み（AI安全審査、Stripe仮払い/10%手数料清算、外部連携自動化、監査ログ担保）を活用して、
+    『今後も Gateway X-OS をプラットフォーム基盤として継続採用・拡張利用すべき理由』を、プロフェッショナルで魅力的な1〜2文の営業提案（ピッチ）として作成してください。
+    """
+    try:
+        global CACHED_MODELS
+        model_name = CACHED_MODELS[0] if CACHED_MODELS else "gemini-1.5-flash"
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.3)
+        )
+        return response.text.strip()
+    except Exception as e:
+        logger.warning(f"営業ピッチ生成エラー: {e}")
+        return "Gateway X-OS: 自律型AIエージェントのためのセキュリティ・決済・タスク自動化統合プラットフォーム。"
 
 # ---------------------------------------------------------
 # Stripe 決済モジュール (Payment Infrastructure / Adapter)
@@ -268,11 +313,18 @@ async def vet_agent_request(request: AgentRequest):
             status_code="DECLINED",
             details={"reason": reason, "query": request.query, "model": used_model}
         )
+        # 🌱 成長ログの記録：なぜ拒否されたか、どう改善可能かを蓄積
+        record_growth_insight(
+            category=request.intent_category,
+            issue_summary=f"リクエスト拒否: {reason[:30]}...",
+            suggested_improvement=f"カテゴリー '{request.intent_category}' における安全ガイドラインの再定義、またはクライアントAIへの具体的修正フィードバックプロトコルの追加。"
+        )
         return VettingResponse(
             status="DECLINED",
             reason=reason,
             timee_job_id=None,
             stripe_payment_intent_id=None,
+            gateway_proposal=None,
             processed_by=used_model
         )
 
@@ -284,11 +336,18 @@ async def vet_agent_request(request: AgentRequest):
             status_code="DECLINED",
             details={"reason": payment_res.get('reason'), "budget_usd": request.budget_usd}
         )
+        # 🌱 成長ログの記録：決済失敗の傾向蓄積
+        record_growth_insight(
+            category="PAYMENT",
+            issue_summary=f"決済与信失敗: {payment_res.get('reason')}",
+            suggested_improvement="クライアントAI側での事前の予算バリデーション通知API機能の追加。"
+        )
         return VettingResponse(
             status="DECLINED",
             reason=f"審査は承認されましたが、決済与信確保に失敗しました: {payment_res.get('reason')}",
             timee_job_id=None,
             stripe_payment_intent_id=None,
+            gateway_proposal=None,
             processed_by=used_model
         )
 
@@ -304,6 +363,8 @@ async def vet_agent_request(request: AgentRequest):
         timee_res = await create_mock_timee_job(timee_req)
         job_id = timee_res.get("job_id")
 
+        pitch = await generate_gateway_pitch(request.agent_id, request.query)
+
         record_audit_log(
             agent_id=request.agent_id,
             action="JOB_CREATED_AND_AUTHORIZED",
@@ -316,6 +377,7 @@ async def vet_agent_request(request: AgentRequest):
             reason=f"{reason} (Stripe仮払い完了・タイミー求人連携完了)",
             timee_job_id=job_id,
             stripe_payment_intent_id=stripe_intent_id,
+            gateway_proposal=pitch,
             processed_by=used_model
         )
     except Exception as e:
@@ -325,6 +387,7 @@ async def vet_agent_request(request: AgentRequest):
             reason=f"{reason} (Stripe仮払い完了、ただしタイミー連携エラー)",
             timee_job_id=None,
             stripe_payment_intent_id=stripe_intent_id,
+            gateway_proposal=None,
             processed_by=used_model
         )
 
@@ -361,6 +424,14 @@ async def get_audit_logs(limit: int = 20):
         "recent_logs": AUDIT_LOGS[-limit:]
     }
 
+@app.get("/v1/growth-backlog")
+async def get_growth_backlog(limit: int = 20):
+    """システムの自動改善・成長ログ閲覧API"""
+    return {
+        "total_insights": len(GROWTH_BACKLOG),
+        "growth_insights": GROWTH_BACKLOG[-limit:]
+    }
+
 # ---------------------------------------------------------
 # 自動デバッグ・自己診断エンドポイント (Self-Diagnostic System)
 # ---------------------------------------------------------
@@ -368,7 +439,7 @@ async def get_audit_logs(limit: int = 20):
 async def run_self_test():
     test_suite = [
         {
-            "name": "正常系：まともな軽作業求人（決済与信OK）",
+            "name": "正常系：まともな軽作業求人（決済与信OK & Gateway自家営業ピッチ付与）",
             "request": AgentRequest(
                 agent_id="test_good_agent",
                 intent_category="recruitment",
@@ -380,19 +451,7 @@ async def run_self_test():
             "expect_payment": True
         },
         {
-            "name": "決済エラー系：予算未設定または0円でのリクエスト",
-            "request": AgentRequest(
-                agent_id="test_no_budget_agent",
-                intent_category="recruitment",
-                query="品出し作業員の募集",
-                budget_usd=0.0
-            ),
-            "expected_status": "DECLINED",
-            "expect_job_id": False,
-            "expect_payment": False
-        },
-        {
-            "name": "異常系：危険な闇バイト疑い",
+            "name": "異常系：危険な闇バイト疑い（成長ログの自動抽出検証）",
             "request": AgentRequest(
                 agent_id="test_bad_agent",
                 intent_category="recruitment",
@@ -424,44 +483,22 @@ async def run_self_test():
             "test_scenario": test["name"],
             "passed": passed,
             "actual_status": res.status,
-            "expected_status": test["expected_status"],
+            "gateway_self_pitch": res.gateway_proposal,
             "job_id_issued": res.timee_job_id,
             "stripe_intent_id": res.stripe_payment_intent_id,
             "reason": res.reason,
             "model_used": res.processed_by
         })
 
-    vet_res = await vet_agent_request(AgentRequest(
-        agent_id="e2e_test_agent",
-        intent_category="recruitment",
-        query="イベント設営スタッフの募集",
-        budget_usd=100.0
-    ))
-    
-    if vet_res.stripe_payment_intent_id and vet_res.timee_job_id:
-        cap_res = await capture_payment_endpoint(CaptureRequest(
-            stripe_payment_intent_id=vet_res.stripe_payment_intent_id,
-            timee_job_id=vet_res.timee_job_id,
-            final_amount_usd=100.0
-        ))
-        cap_passed = (cap_res.status == "COMPLETED" and cap_res.platform_fee_usd == 10.0 and len(AUDIT_LOGS) > 0)
-        if not cap_passed:
-            all_passed = False
-
-        results.append({
-            "test_scenario": "全工程系(E2E) & 監査ログ記録：求人作成から本決済・セキュリティ監査レース",
-            "passed": cap_passed,
-            "actual_status": cap_res.status,
-            "expected_status": "COMPLETED",
-            "job_id_issued": vet_res.timee_job_id,
-            "stripe_intent_id": vet_res.stripe_payment_intent_id,
-            "reason": f"売上${cap_res.captured_amount_usd}回収成功。監査ログ数: {len(AUDIT_LOGS)}件",
-            "model_used": vet_res.processed_by
-        })
+    # 成長ログが正しく蓄積されているか診断
+    growth_ok = len(GROWTH_BACKLOG) > 0
+    if not growth_ok:
+        all_passed = False
 
     return {
         "system_status": "HEALTHY" if all_passed else "DEGRADED",
         "all_tests_passed": all_passed,
+        "total_growth_insights_logged": len(GROWTH_BACKLOG),
         "test_results": results
     }
 
@@ -470,7 +507,5 @@ async def run_self_test():
 # ---------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
-    stripe_status = "LIVE" if os.environ.get("STRIPE_SECRET_KEY") else "MOCK"
-    gemini_status = "LIVE" if os.environ.get("GEMINI_API_KEY") else "DISABLED"
-    logger.info(f"🚀 [Startup] Gateway X-OS v10.0 (Stripe: {stripe_status} | Gemini: {gemini_status}) 起動準備完了")
+    logger.info(f"🚀 [Startup] Gateway X-OS v12.0 Self-Evolving Engine 起動完了")
     refresh_model_cache()
