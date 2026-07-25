@@ -2,7 +2,6 @@ import os
 import json
 import logging
 import uuid
-import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -12,7 +11,7 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Gateway X-OS Vetting & Mock Timee Engine", version="5.0")
+app = FastAPI(title="Gateway X-OS Vetting & Mock Timee Engine", version="5.1")
 
 # ---------------------------------------------------------
 # グローバル変数：利用可能モデルのキャッシュ（パフォーマンス最適化）
@@ -76,11 +75,11 @@ class TimeeJobRequest(BaseModel):
     location: str
 
 # ---------------------------------------------------------
-# 偽タイミー (Mock Timee) エンドポイント
+# 偽タイミー (Mock Timee) エンドポイント / 内部関数
 # ---------------------------------------------------------
 @app.post("/mock/timee/jobs")
 async def create_mock_timee_job(req: TimeeJobRequest):
-    """本物のタイミーの挙動を模倣するモックAPI"""
+    """本物のタイミーの挙動を模倣するモック機能"""
     mock_job_id = f"JOB-2026-{uuid.uuid4().hex[:6].upper()}"
     logger.info(f"✨ [Mock Timee] 求人作成成功: {mock_job_id} ({req.title})")
     return {
@@ -184,39 +183,29 @@ async def vet_agent_request(request: AgentRequest):
             processed_by=used_model
         )
 
-    # 3. APPROVED の場合、全自動で「偽タイミー」へ求人を送る
+    # 3. APPROVED の場合、内部の偽タイミー関数を直接実行（通信不要で高速化）
     try:
-        async with httpx.AsyncClient() as http_client:
-            # 自分自身の /mock/timee/jobs へリクエスト（ローカル通信）
-            mock_url = "[http://127.0.0.1:10000/mock/timee/jobs](http://127.0.0.1:10000/mock/timee/jobs)"
-            timee_payload = {
-                "title": f"[{request.agent_id}] 依頼求人",
-                "wage": 1500,  # 仮の値（本来はクエリから抽出）
-                "workers_needed": 1,
-                "location": "東京都内"
-            }
-            timee_res = await http_client.post(mock_url, json=timee_payload, timeout=5.0)
-            
-            if timee_res.status_code == 200:
-                job_id = timee_res.json().get("job_id")
-                return VettingResponse(
-                    status="APPROVED",
-                    reason=f"{reason} (タイミー求人連携完了)",
-                    timee_job_id=job_id,
-                    processed_by=used_model
-                )
-            else:
-                return VettingResponse(
-                    status="APPROVED",
-                    reason=f"{reason} (ただしタイミー連携時にエラーが発生しました)",
-                    timee_job_id=None,
-                    processed_by=used_model
-                )
-    except Exception as e:
-        logger.error(f"偽タイミー通信エラー: {e}")
+        timee_req = TimeeJobRequest(
+            title=f"[{request.agent_id}] 依頼求人",
+            wage=1500,
+            workers_needed=1,
+            location="東京都内"
+        )
+        # HTTP通信を挟まず、直接モック関数を実行してIDを発行
+        timee_res = await create_mock_timee_job(timee_req)
+        job_id = timee_res.get("job_id")
+
         return VettingResponse(
             status="APPROVED",
-            reason=f"{reason} (タイミー通信タイムアウト)",
+            reason=f"{reason} (タイミー求人連携完了)",
+            timee_job_id=job_id,
+            processed_by=used_model
+        )
+    except Exception as e:
+        logger.error(f"偽タイミー連携エラー: {e}")
+        return VettingResponse(
+            status="APPROVED",
+            reason=f"{reason} (タイミー連携時にエラーが発生しました)",
             timee_job_id=None,
             processed_by=used_model
         )
@@ -226,7 +215,7 @@ async def vet_agent_request(request: AgentRequest):
 # ---------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 [Startup] Gateway X-OS v5.0 起動準備中...")
+    logger.info("🚀 [Startup] Gateway X-OS v5.1 起動準備中...")
     refresh_model_cache()
     
     # 起動時のセルフテスト実行
