@@ -22,20 +22,28 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 app = FastAPI(
     title="Gateway X-OS",
-    version="3.1.0",
+    version="3.1.1",
     description="Physical Execution API Gateway for Autonomous AI Agents & Quant Platforms"
 )
 
 DB_FILE = "gateway.db"
 
 # ====================================================
-# 2. データベース永続化層 (Persistence Layer)
+# 2. データベース永続化層 (SQLite WAL & Lock Defense)
 # ====================================================
 
+def get_db_connection():
+    """ロック対策を強化したSQLite接続を取得"""
+    conn = sqlite3.connect(DB_FILE, timeout=10.0)
+    return conn
+
 def init_db():
-    """データベーステーブルの初期化"""
-    conn = sqlite3.connect(DB_FILE)
+    """データベーステーブルの初期化とWALモードの有効化"""
+    conn = get_db_connection()
     cursor = conn.cursor()
+    
+    # WAL (Write-Ahead Logging) モードの有効化（並行アクセスロック対策）
+    cursor.execute("PRAGMA journal_mode=WAL;")
     
     # 成長・監査ログテーブル
     cursor.execute("""
@@ -78,11 +86,11 @@ init_db()
 
 
 class DatabaseRepository:
-    """【リポジトリ】SQLiteを用いた永続化アクセスオブジェクト"""
+    """【リポジトリ】ロック耐性を備えたSQLiteアクセスオブジェクト"""
     
     @staticmethod
     def add_log(event_type: str, payload: Dict[str, Any]):
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO growth_logs (event_type, payload) VALUES (?, ?)",
@@ -93,7 +101,7 @@ class DatabaseRepository:
 
     @staticmethod
     def get_declined_logs() -> List[Dict[str, Any]]:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT payload FROM growth_logs WHERE event_type = 'DECLINED'")
         rows = cursor.fetchall()
@@ -102,7 +110,7 @@ class DatabaseRepository:
 
     @staticmethod
     def add_learned_rule(rule_text: str):
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("INSERT INTO learned_rules (rule_text) VALUES (?)", (rule_text,))
         conn.commit()
@@ -110,7 +118,7 @@ class DatabaseRepository:
 
     @staticmethod
     def get_learned_rules() -> List[str]:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT rule_text FROM learned_rules ORDER BY id DESC LIMIT 10")
         rows = cursor.fetchall()
@@ -119,7 +127,7 @@ class DatabaseRepository:
 
     @staticmethod
     def save_quote(quote_id: str, intent: str, tier: str, price_usd: float, cost_jpy: int, margin: float):
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO quotes (quote_id, intent, tier, price_usd, estimated_cost_jpy, margin_percent, status) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE')",
@@ -130,7 +138,7 @@ class DatabaseRepository:
 
     @staticmethod
     def get_quote(quote_id: str) -> Optional[Dict[str, Any]]:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT quote_id, intent, tier, price_usd, estimated_cost_jpy, margin_percent, status FROM quotes WHERE quote_id = ?", (quote_id,))
         row = cursor.fetchone()
@@ -153,9 +161,9 @@ class DatabaseRepository:
 # ====================================================
 
 class SLATier(str, Enum):
-    ECONOMY = "economy"      # タイミーハック / 24時間猶予 (~55% マージン)
-    EXPRESS = "express"      # 即時派遣 / サージプライシング (~80% マージン)
-    TACTICAL = "tactical"    # 高難度・高秘匿 / Tactical Force (90%+ マージン)
+    ECONOMY = "economy"
+    EXPRESS = "express"
+    TACTICAL = "tactical"
 
 
 class DynamicSafetyPolicy:
@@ -189,22 +197,19 @@ safety_policy = DynamicSafetyPolicy()
 class DynamicPricingEngine:
     """【Naval-Collisonモデル】価値・緊急度ベースの動的プライシングエンジン"""
 
-    USD_TO_JPY_RATE = 155.0  # 為替基準レート
+    USD_TO_JPY_RATE = 155.0
 
     @classmethod
     def calculate_quote(cls, intent: str, tier: SLATier, estimated_ground_cost_jpy: int) -> Dict[str, Any]:
         ground_cost_usd = estimated_ground_cost_jpy / cls.USD_TO_JPY_RATE
 
         if tier == SLATier.ECONOMY:
-            # Tier 1: 原価 + 55% マージン
             margin_rate = 0.55
             price_usd = round(ground_cost_usd / (1 - margin_rate), 2)
         elif tier == SLATier.EXPRESS:
-            # Tier 2: サージ/即時派遣 プレミアム (~80% マージン)
             margin_rate = 0.80
             price_usd = round(ground_cost_usd / (1 - margin_rate), 2)
         elif tier == SLATier.TACTICAL:
-            # Tier 3: Value-Based Pricing (90%+ マージン / 最低$2,500保障)
             margin_rate = 0.92
             base_tactical_value = 2500.0
             calculated_price = ground_cost_usd / (1 - margin_rate)
@@ -273,7 +278,7 @@ def vet_task_usecase(user_request: str) -> dict:
 
 
 def async_self_refinement_job():
-    """【バックグラウンド非同期ジョブ】拒絶ログをメタ分析し、プロンプトを自動更新"""
+    """【google-genai v1.0+ 準拠】拒絶ログをメタ分析し、types.Schema でプロンプトを自動更新"""
     declined_logs = DatabaseRepository.get_declined_logs()
     if len(declined_logs) < 1 or not gemini_client:
         return
@@ -286,18 +291,21 @@ def async_self_refinement_job():
     """
 
     try:
+        # google-genai v1.0+ 推奨の types.Schema オブジェクトを構築
+        response_schema = types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "new_rule": types.Schema(type=types.Type.STRING)
+            },
+            required=["new_rule"]
+        )
+
         response = gemini_client.models.generate_content(
             model=MODEL_NAME,
             contents=meta_prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema={
-                    "type": "OBJECT",
-                    "properties": {
-                        "new_rule": {"type": "STRING"}
-                    },
-                    "required": ["new_rule"]
-                },
+                response_schema=response_schema,
                 temperature=0.2
             )
         )
@@ -319,9 +327,9 @@ def read_root():
     learned_rules = DatabaseRepository.get_learned_rules()
     return {
         "system": "Gateway X-OS",
-        "architecture": "Clean Architecture / Dynamic Margin (v3.1.0)",
+        "architecture": "Clean Architecture / Dynamic Margin (v3.1.1)",
         "engine": MODEL_NAME,
-        "database": "SQLite (Persisted)",
+        "database": "SQLite (WAL Mode Enabled)",
         "learned_rules_count": len(learned_rules)
     }
 
@@ -345,7 +353,6 @@ def create_quote(req: QuoteRequest, background_tasks: BackgroundTasks):
             }
         )
 
-    # 動的プライシング計算
     quote = DynamicPricingEngine.calculate_quote(req.intent, req.tier, req.estimated_ground_cost_jpy)
     
     DatabaseRepository.save_quote(
