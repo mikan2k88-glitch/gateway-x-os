@@ -1,8 +1,8 @@
 import os
 import json
 import stripe
-from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from typing import List, Dict, Any
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
@@ -17,7 +17,7 @@ STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 stripe.api_key = STRIPE_SECRET_KEY
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-app = FastAPI(title="Gateway X-OS", version="2.1.0")
+app = FastAPI(title="Gateway X-OS", version="2.2.0")
 
 # ====================================================
 # 2. ドメインエンティティ & アグリゲート (Domain Layer)
@@ -123,32 +123,42 @@ def self_refinement_usecase() -> dict:
     {json.dumps(declined_logs, ensure_ascii=False)}
 
     これらを分析し、過剰な拒絶（誤検知）を抑えつつ、安全性を極限まで高めるための「プロンプトの微修正ルール（日本語1行）」を1つ提案してください。
-    出力フォーマット:
-    {"new_rule": "追加すべき判定ルールの文字列"}
     """
 
-    response = gemini_client.models.generate_content(
-        model=MODEL_NAME,
-        contents=meta_prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.2
+    try:
+        response = gemini_client.models.generate_content(
+            model=MODEL_NAME,
+            contents=meta_prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema={
+                    "type": "OBJECT",
+                    "properties": {
+                        "new_rule": {"type": "STRING"}
+                    },
+                    "required": ["new_rule"]
+                },
+                temperature=0.2
+            )
         )
-    )
 
-    result = json.loads(response.text)
-    new_rule = result.get("new_rule")
+        result = json.loads(response.text)
+        new_rule = result.get("new_rule")
 
-    if new_rule:
-        safety_policy.append_learned_rule(new_rule)
-        growth_repository.add_log("SELF_REFINEMENT", {"added_rule": new_rule})
-        return {
-            "status": "EVOLVED",
-            "added_rule": new_rule,
-            "total_rules": len(safety_policy.learned_context)
-        }
+        if new_rule:
+            safety_policy.append_learned_rule(new_rule)
+            growth_repository.add_log("SELF_REFINEMENT", {"added_rule": new_rule})
+            return {
+                "status": "EVOLVED",
+                "added_rule": new_rule,
+                "total_rules": len(safety_policy.learned_context)
+            }
+        
+        return {"status": "FAILED", "reason": "有効なルールが生成されませんでした。"}
 
-    return {"status": "FAILED", "reason": "有効なルールが生成されませんでした。"}
+    except Exception as e:
+        # 例外時もサーバーを落とさずJSONでエラーを返却するようカプセル化
+        return {"status": "ERROR", "detail": str(e)}
 
 
 # ====================================================
@@ -246,6 +256,8 @@ def trigger_self_refinement():
     蓄積された成長ログを元に、Gemini 3.6 Flash に審査指示（system_instruction）を動的に自己修正させる
     """
     result = self_refinement_usecase()
+    if result.get("status") == "ERROR":
+        raise HTTPException(status_code=500, detail=result)
     return result
 
 
