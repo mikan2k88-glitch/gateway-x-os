@@ -1,8 +1,9 @@
 import os
 import json
+import sqlite3
 import stripe
-from typing import List, Dict, Any
-from fastapi import FastAPI, HTTPException
+from typing import List, Dict, Any, Optional
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
@@ -17,17 +18,93 @@ STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 stripe.api_key = STRIPE_SECRET_KEY
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-app = FastAPI(title="Gateway X-OS", version="2.2.0")
+app = FastAPI(title="Gateway X-OS", version="3.0.0")
+
+DB_FILE = "gateway.db"
 
 # ====================================================
-# 2. ドメインエンティティ & アグリゲート (Domain Layer)
+# 2. データベース永続化層 (Persistence Layer)
+# ====================================================
+
+def init_db():
+    """データベーステーブルの初期化"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # 成長ログテーブル
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS growth_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # 動的学習ルールテーブル
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS learned_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_text TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+
+# アプリ起動時にDB初期化
+init_db()
+
+
+class DatabaseRepository:
+    """【リポジトリ】SQLiteを用いた永続化アクセスオブジェクト"""
+    
+    @staticmethod
+    def add_log(event_type: str, payload: Dict[str, Any]):
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO growth_logs (event_type, payload) VALUES (?, ?)",
+            (event_type, json.dumps(payload, ensure_ascii=False))
+        )
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def get_declined_logs() -> List[Dict[str, Any]]:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT payload FROM growth_logs WHERE event_type = 'DECLINED'")
+        rows = cursor.fetchall()
+        conn.close()
+        return [json.loads(r[0]) for r in rows]
+
+    @staticmethod
+    def add_learned_rule(rule_text: str):
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO learned_rules (rule_text) VALUES (?)", (rule_text,))
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def get_learned_rules() -> List[str]:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT rule_text FROM learned_rules ORDER BY id DESC LIMIT 10")
+        rows = cursor.fetchall()
+        conn.close()
+        return [r[0] for r in reversed(rows)]
+
+
+# ====================================================
+# 3. ドメインエンティティ (Domain Layer)
 # ====================================================
 
 class DynamicSafetyPolicy:
-    """
-    【ドメインルール】自己進化型安全審査ポリシー
-    成長ログ（growth-backlog）から自己学習し、動的にプロンプトを更新する
-    """
+    """【ドメインルール】永続化DBと同期する自己進化型安全審査ポリシー"""
+    
     def __init__(self):
         self.base_instruction = """
         あなたは Gateway X-OS の厳格な金融・タスク安全監査AIです。
@@ -38,48 +115,23 @@ class DynamicSafetyPolicy:
         出力フォーマット(JSON):
         {"status": "APPROVED" | "DECLINED", "reason": "審査理由の詳細"}
         """
-        self.learned_context: List[str] = []
 
     def get_effective_instruction(self) -> str:
-        """学習されたフィードバックを反映した最新のシステムプロンプトを生成"""
-        if not self.learned_context:
+        learned_rules = DatabaseRepository.get_learned_rules()
+        if not learned_rules:
             return self.base_instruction
         
-        added_rules = "\n".join([f"- {rule}" for rule in self.learned_context[-10:]]) # 最新10件の学習ルールを反映
+        added_rules = "\n".join([f"- {rule}" for rule in learned_rules])
         return f"{self.base_instruction}\n\n【自動改善により獲得した追加基準】:\n{added_rules}"
 
-    def append_learned_rule(self, new_rule: str):
-        """新しい安全基準を追加（自己進化）"""
-        self.learned_context.append(new_rule)
 
-
-class GrowthBacklogRepository:
-    """【リポジトリ】イベントログ（成長バックログ）の永続化・保持層"""
-    def __init__(self):
-        self._logs: List[Dict[str, Any]] = []
-
-    def add_log(self, event_type: str, payload: Dict[str, Any]):
-        log_entry = {
-            "type": event_type,
-            "payload": payload
-        }
-        self._logs.append(log_entry)
-
-    def get_all_logs(self) -> List[Dict[str, Any]]:
-        return self._logs
-
-    def get_declined_logs(self) -> List[Dict[str, Any]]:
-        return [log for log in self._logs if log["type"] == "DECLINED"]
-
-
-# シングルトンとして状態管理
 safety_policy = DynamicSafetyPolicy()
-growth_repository = GrowthBacklogRepository()
 
 
 # ====================================================
-# 3. リクエスト／レスポンス DTO (Presentation Layer)
+# 4. リクエスト／レスポンス DTO (Presentation Layer)
 # ====================================================
+
 class TaskRequest(BaseModel):
     user_request: str = Field(..., description="依頼するタスクの内容")
     amount_jpy: int = Field(..., description="仮払い金額（円）")
@@ -89,11 +141,11 @@ class CaptureRequest(BaseModel):
 
 
 # ====================================================
-# 4. ユースケース / アプリケーションサービス
+# 5. ユースケース / アプリケーションサービス
 # ====================================================
 
 def vet_task_usecase(user_request: str) -> dict:
-    """Gemini 3.6 Flash による安全審査ユースケース"""
+    """Gemini 3.6 Flash による安全審査"""
     current_instruction = safety_policy.get_effective_instruction()
 
     response = gemini_client.models.generate_content(
@@ -108,16 +160,14 @@ def vet_task_usecase(user_request: str) -> dict:
     return json.loads(response.text)
 
 
-def self_refinement_usecase() -> dict:
-    """
-    【Core Engine】成長ログを分析し、Gemini 3.6 Flash が判定指示を動的にメタ自己修正する
-    """
-    declined_logs = growth_repository.get_declined_logs()
+def async_self_refinement_job():
+    """【バックグラウンド非同期ジョブ】ログをメタ分析し、プロンプトを自動更新"""
+    declined_logs = DatabaseRepository.get_declined_logs()
     
-    if not declined_logs:
-        return {"status": "SKIPPED", "reason": "分析対象となる拒絶ログ（DECLINED）が十分に蓄積されていません。"}
+    # スロットリング：拒絶ログがある程度蓄積された場合のみ実行
+    if len(declined_logs) < 1:
+        return
 
-    # メタ分析用プロンプト生成
     meta_prompt = f"""
     以下は、Gateway X-OS の安全審査エンジンで過去に「拒絶（DECLINED）」判定されたタスクのログです：
     {json.dumps(declined_logs, ensure_ascii=False)}
@@ -146,46 +196,45 @@ def self_refinement_usecase() -> dict:
         new_rule = result.get("new_rule")
 
         if new_rule:
-            safety_policy.append_learned_rule(new_rule)
-            growth_repository.add_log("SELF_REFINEMENT", {"added_rule": new_rule})
-            return {
-                "status": "EVOLVED",
-                "added_rule": new_rule,
-                "total_rules": len(safety_policy.learned_context)
-            }
-        
-        return {"status": "FAILED", "reason": "有効なルールが生成されませんでした。"}
+            DatabaseRepository.add_learned_rule(new_rule)
+            DatabaseRepository.add_log("SELF_REFINEMENT", {"added_rule": new_rule})
+            print(f"[Self-Refinement Success] New Rule Added: {new_rule}")
 
     except Exception as e:
-        # 例外時もサーバーを落とさずJSONでエラーを返却するようカプセル化
-        return {"status": "ERROR", "detail": str(e)}
+        print(f"[Self-Refinement Error]: {e}")
 
 
 # ====================================================
-# 5. API エンドポイント (Interface Adapters)
+# 6. API エンドポイント (Interface Adapters)
 # ====================================================
 
 @app.get("/")
 def read_root():
+    learned_rules = DatabaseRepository.get_learned_rules()
     return {
         "system": "Gateway X-OS",
-        "architecture": "Clean Architecture / DDD",
+        "architecture": "Clean Architecture / DDD (v3.0.0)",
         "engine": MODEL_NAME,
-        "learned_rules_count": len(safety_policy.learned_context)
+        "database": "SQLite (Persisted)",
+        "learned_rules_count": len(learned_rules)
     }
 
 
 @app.post("/api/v1/vet-and-hold")
-def vet_and_hold(req: TaskRequest):
-    """【1. 審査 ➔ 2. 仮払い（与信確保）】"""
+def vet_and_hold(req: TaskRequest, background_tasks: BackgroundTasks):
+    """【1. 審査 ➔ 2. 仮払い（与信確保） ➔ 3. 裏で非同期自己学習】"""
     vetting_result = vet_task_usecase(req.user_request)
 
     if vetting_result.get("status") == "DECLINED":
-        # 拒絶ログを登録
-        growth_repository.add_log("DECLINED", {
+        # 拒絶ログをDBへ登録
+        DatabaseRepository.add_log("DECLINED", {
             "request": req.user_request,
             "reason": vetting_result.get("reason")
         })
+        
+        # ⚡ バックグラウンドで非同期に自己学習を発火（レスポンスを待たせない）
+        background_tasks.add_task(async_self_refinement_job)
+
         return {
             "status": "DECLINED",
             "reason": vetting_result.get("reason"),
@@ -204,7 +253,7 @@ def vet_and_hold(req: TaskRequest):
             description="Gateway X-OS タスク仮払い"
         )
         
-        growth_repository.add_log("APPROVED", {"request": req.user_request, "payment_intent_id": intent.id})
+        DatabaseRepository.add_log("APPROVED", {"request": req.user_request, "payment_intent_id": intent.id})
         
         return {
             "status": "APPROVED",
@@ -220,7 +269,7 @@ def vet_and_hold(req: TaskRequest):
 
 @app.post("/api/v1/capture")
 def capture_payment(req: CaptureRequest):
-    """【3. 作業完了時：本決済 & 10%手数料徴収】"""
+    """【作業完了時：本決済 & 10%手数料徴収】"""
     try:
         intent = stripe.PaymentIntent.retrieve(req.payment_intent_id)
         total_amount = intent.amount
@@ -229,7 +278,7 @@ def capture_payment(req: CaptureRequest):
 
         captured_intent = stripe.PaymentIntent.capture(req.payment_intent_id)
 
-        growth_repository.add_log("CAPTURED", {
+        DatabaseRepository.add_log("CAPTURED", {
             "payment_intent_id": captured_intent.id,
             "fee_earned": platform_fee
         })
@@ -249,23 +298,10 @@ def capture_payment(req: CaptureRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/v1/self-refine")
-def trigger_self_refinement():
-    """
-    【自己進化エンドポイント】
-    蓄積された成長ログを元に、Gemini 3.6 Flash に審査指示（system_instruction）を動的に自己修正させる
-    """
-    result = self_refinement_usecase()
-    if result.get("status") == "ERROR":
-        raise HTTPException(status_code=500, detail=result)
-    return result
-
-
 @app.get("/api/v1/growth-backlog")
 def get_growth_backlog():
-    """成長ログおよび現在の動的プロンプトの閲覧"""
+    """成長ログおよび永続化されたプロンプト状態の閲覧"""
     return {
         "current_effective_instruction": safety_policy.get_effective_instruction(),
-        "total_logs": len(growth_repository.get_all_logs()),
-        "logs": growth_repository.get_all_logs()
+        "learned_rules": DatabaseRepository.get_learned_rules()
     }
