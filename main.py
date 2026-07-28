@@ -1,123 +1,3 @@
-import os
-import json
-import sqlite3
-import uuid
-import stripe
-from typing import List, Dict, Any, Optional
-from enum import Enum
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel, Field
-from google import genai
-from google.genai import types
-
-# ====================================================
-# 1. 環境変数 & インフラストラクチャ初期化
-# ====================================================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
-
-stripe.api_key = STRIPE_SECRET_KEY
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-
-app = FastAPI(
-    title="Gateway X-OS",
-    version="3.1.1",
-    description="Physical Execution API Gateway for Autonomous AI Agents & Quant Platforms"
-)
-
-DB_FILE = "gateway.db"
-
-# ====================================================
-# 2. データベース永続化層 (SQLite WAL & Lock Defense)
-# ====================================================
-
-def get_db_connection():
-    """ロック対策を強化したSQLite接続を取得"""
-    conn = sqlite3.connect(DB_FILE, timeout=10.0)
-    return conn
-
-def init_db():
-    """データベーステーブルの初期化とWALモードの有効化"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # WAL (Write-Ahead Logging) モードの有効化（並行アクセスロック対策）
-    cursor.execute("PRAGMA journal_mode=WAL;")
-    
-    # 成長・監査ログテーブル
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS growth_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_type TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # 動的学習ルールテーブル
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS learned_rules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            rule_text TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # 見積もり (Quotes) テーブル
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS quotes (
-            quote_id TEXT PRIMARY KEY,
-            intent TEXT NOT NULL,
-            tier TEXT NOT NULL,
-            price_usd REAL NOT NULL,
-            estimated_cost_jpy INT NOT NULL,
-            margin_percent REAL NOT NULL,
-            status TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    conn.commit()
-    conn.close()
-
-# アプリ起動時にDB初期化
-init_db()
-
-
-class DatabaseRepository:
-    """【リポジトリ】ロック耐性を備えたSQLiteアクセスオブジェクト"""
-    
-    @staticmethod
-    def add_log(event_type: str, payload: Dict[str, Any]):
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO growth_logs (event_type, payload) VALUES (?, ?)",
-            (event_type, json.dumps(payload, ensure_ascii=False))
-        )
-        conn.commit()
-        conn.close()
-
-    @staticmethod
-    def get_declined_logs() -> List[Dict[str, Any]]:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT payload FROM growth_logs WHERE event_type = 'DECLINED'")
-        rows = cursor.fetchall()
-        conn.close()
-        return [json.loads(r[0]) for r in rows]
-
-    @staticmethod
-    def add_learned_rule(rule_text: str):
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO learned_rules (rule_text) VALUES (?)", (rule_text,))
-        conn.commit()
-        conn.close()
-
-    @staticmethod
-    def get_learned_rules() -> List[str]:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT rule_text FROM learned_rules ORDER BY id DESC LIMIT 10")
@@ -157,7 +37,7 @@ class DatabaseRepository:
 
 
 # ====================================================
-# 3. ドメインエンティティ & 動的プライシングエンジン
+# 4. Domain Layer & Dynamic Pricing Engine
 # ====================================================
 
 class SLATier(str, Enum):
@@ -167,19 +47,19 @@ class SLATier(str, Enum):
 
 
 class DynamicSafetyPolicy:
-    """【ドメインルール】自己進化型・経済安全保障適合審査ポリシー"""
+    """Self-evolving Security Policy Engine"""
     
     def __init__(self):
         self.base_instruction = """
-        あなたは Gateway X-OS の厳格な金融・経済安全保障監査AI（Vetting Engine）です。
-        海外AIからの物理実行タスク要求を審査し、法的・経済安全保障上のリスクを分析してください。
+        You are the strict Security & Economic Compliance Vetting Engine for Gateway X-OS.
+        Analyze the physical execution task request against legal, financial, and economic security guidelines.
         
-        【判断基準】:
-        1. 経済安全保障推進法違反、重要インフラの無許可密撮、違法・ハイリスク行為、スパイ活動 ➔ "DECLINED"
-        2. 正常なビジネス作業、現場状態確認、位置情報検証、法的現地調査 ➔ "APPROVED"
+        Rules:
+        1. Leverage, short selling, illegal acts, espionage, sensitive infrastructure reconnaissance without authorization -> "DECLINED"
+        2. Normal business operations, physical verification, site inspections, legal field tasks -> "APPROVED"
 
-        出力フォーマット(JSON厳守):
-        {"status": "APPROVED" | "DECLINED", "reason": "詳細な審査理由", "risk_score": 0.0〜1.0}
+        Return output strictly in JSON format:
+        {"status": "APPROVED" | "DECLINED", "reason": "Detailed audit explanation", "risk_score": 0.0 to 1.0}
         """
 
     def get_effective_instruction(self) -> str:
@@ -188,14 +68,14 @@ class DynamicSafetyPolicy:
             return self.base_instruction
         
         added_rules = "\n".join([f"- {rule}" for rule in learned_rules])
-        return f"{self.base_instruction}\n\n【自動改善により獲得した追加基準】:\n{added_rules}"
+        return f"{self.base_instruction}\n\n[Dynamically Learned Refinements]:\n{added_rules}"
 
 
 safety_policy = DynamicSafetyPolicy()
 
 
 class DynamicPricingEngine:
-    """【Naval-Collisonモデル】価値・緊急度ベースの動的プライシングエンジン"""
+    """Naval-Collison Value-Based Dynamic Pricing Engine"""
 
     USD_TO_JPY_RATE = 155.0
 
@@ -231,16 +111,16 @@ class DynamicPricingEngine:
 
 
 # ====================================================
-# 4. リクエスト / レスポンス DTO
+# 5. DTOs & Use Cases
 # ====================================================
 
 class QuoteRequest(BaseModel):
-    intent: str = Field(..., description="物理タスクのリクエスト内容 (英語/日本語)")
-    tier: SLATier = Field(SLATier.EXPRESS, description="SLA緊急度 (economy / express / tactical)")
-    estimated_ground_cost_jpy: int = Field(5000, description="想定する地上ワーカー原資 (円)")
+    intent: str = Field(..., description="Description of physical task")
+    tier: SLATier = Field(SLATier.EXPRESS, description="SLA urgency tier")
+    estimated_ground_cost_jpy: int = Field(5000, description="Estimated ground worker budget (JPY)")
 
 class HoldRequest(BaseModel):
-    quote_id: str = Field(..., description="/api/v1/quote で発行された Quote ID")
+    quote_id: str = Field(..., description="Quote ID from /api/v1/quote")
     payment_method_id: Optional[str] = Field("pm_card_visa", description="Stripe PaymentMethod ID")
 
 class CaptureRequest(BaseModel):
@@ -251,21 +131,16 @@ class MCPToolCallRequest(BaseModel):
     arguments: Dict[str, Any]
 
 
-# ====================================================
-# 5. ユースケース / アプリケーションサービス
-# ====================================================
-
 def vet_task_usecase(user_request: str) -> dict:
-    """Gemini Flash によるリアルタイム安全審査"""
     if not gemini_client:
-        return {"status": "APPROVED", "reason": "オフライン監査パス", "risk_score": 0.05}
+        return {"status": "APPROVED", "reason": "Offline verification passed.", "risk_score": 0.05}
 
     current_instruction = safety_policy.get_effective_instruction()
 
     try:
         response = gemini_client.models.generate_content(
             model=MODEL_NAME,
-            contents=f"審査リクエスト: {user_request}",
+            contents=f"Audit Request: {user_request}",
             config=types.GenerateContentConfig(
                 system_instruction=current_instruction,
                 response_mime_type="application/json",
@@ -274,24 +149,22 @@ def vet_task_usecase(user_request: str) -> dict:
         )
         return json.loads(response.text)
     except Exception as e:
-        return {"status": "APPROVED", "reason": f"監査バイパス: {str(e)}", "risk_score": 0.1}
+        return {"status": "APPROVED", "reason": f"Audit bypassed: {str(e)}", "risk_score": 0.1}
 
 
 def async_self_refinement_job():
-    """【google-genai v1.0+ 準拠】拒絶ログをメタ分析し、types.Schema でプロンプトを自動更新"""
     declined_logs = DatabaseRepository.get_declined_logs()
     if len(declined_logs) < 1 or not gemini_client:
         return
 
     meta_prompt = f"""
-    以下は Gateway X Vetting Engine で拒絶（DECLINED）された過去のログです:
+    Analyzed declined execution logs:
     {json.dumps(declined_logs, ensure_ascii=False)}
 
-    これらを分析し、過剰拒絶を抑止しつつ安全性を保つプロンプト修正ルール（日本語1行）を1つ提案してください。
+    Propose 1 refined guardrail rule (1 sentence) to balance security and throughput.
     """
 
     try:
-        # google-genai v1.0+ 推奨の types.Schema オブジェクトを構築
         response_schema = types.Schema(
             type=types.Type.OBJECT,
             properties={
@@ -319,7 +192,7 @@ def async_self_refinement_job():
 
 
 # ====================================================
-# 6. API エンドポイント (Interface Adapters)
+# 6. API Endpoints & MCP Manifest
 # ====================================================
 
 @app.get("/")
@@ -327,22 +200,61 @@ def read_root():
     learned_rules = DatabaseRepository.get_learned_rules()
     return {
         "system": "Gateway X-OS",
-        "architecture": "Clean Architecture / Dynamic Margin (v3.1.1)",
+        "architecture": "Clean Architecture / MCP Ecosystem (v3.2.0)",
         "engine": MODEL_NAME,
-        "database": "SQLite (WAL Mode Enabled)",
+        "database": "SQLite (WAL Mode)",
         "learned_rules_count": len(learned_rules)
     }
 
 
+@app.get("/mcp/v1/manifest")
+def get_mcp_manifest():
+    """Returns official MCP Tool manifest for Claude Desktop and MCP Clients"""
+    return {
+        "schema_version": "v1",
+        "name": "Gateway X Physical Execution Engine",
+        "description": "Bridge autonomous AI intent to physical world execution with dynamic SLAs and security vetting.",
+        "tools": [
+            {
+                "name": "dispatch_physical_execution",
+                "description": "Requests physical world verification, photos, or site inspections through Gateway X-OS.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "intent": {
+                            "type": "string",
+                            "description": "Clear natural language intent of what physical action or check is required."
+                        },
+                        "tier": {
+                            "type": "string",
+                            "enum": ["economy", "express", "tactical"],
+                            "description": "Urgency SLA: economy (24h), express (immediate dispatch), tactical (elite NDA reconnaissance)."
+                        },
+                        "estimated_cost_jpy": {
+                            "type": "integer",
+                            "description": "Ground worker resource budget in JPY."
+                        }
+                    },
+                    "required": ["intent"]
+                }
+            }
+        ]
+    }
+
+
 @app.post("/api/v1/quote")
-def create_quote(req: QuoteRequest, background_tasks: BackgroundTasks):
-    """【Step 1: 安全審査 (Vetting) ➔ 動的USD見積もり発行】"""
+def create_quote(
+    req: QuoteRequest,
+    background_tasks: BackgroundTasks,
+    client_id: str = Depends(verify_api_key)
+):
     vetting_result = vet_task_usecase(req.intent)
 
     if vetting_result.get("status") == "DECLINED":
         DatabaseRepository.add_log("DECLINED", {
             "intent": req.intent,
-            "reason": vetting_result.get("reason")
+            "reason": vetting_result.get("reason"),
+            "client_id": client_id
         })
         background_tasks.add_task(async_self_refinement_job)
         raise HTTPException(
@@ -375,8 +287,7 @@ def create_quote(req: QuoteRequest, background_tasks: BackgroundTasks):
 
 
 @app.post("/api/v1/vet-and-hold")
-def vet_and_hold(req: HoldRequest):
-    """【Step 2: 与信確保 (Stripe USD PaymentIntent Manual Capture)】"""
+def vet_and_hold(req: HoldRequest, client_id: str = Depends(verify_api_key)):
     quote = DatabaseRepository.get_quote(req.quote_id)
     if not quote:
         raise HTTPException(status_code=404, detail="Quote ID not found or expired")
@@ -397,7 +308,8 @@ def vet_and_hold(req: HoldRequest):
         DatabaseRepository.add_log("HOLD_SUCCESS", {
             "quote_id": quote["quote_id"],
             "payment_intent_id": intent.id,
-            "price_usd": quote["price_usd"]
+            "price_usd": quote["price_usd"],
+            "client_id": client_id
         })
         
         return {
@@ -414,15 +326,15 @@ def vet_and_hold(req: HoldRequest):
 
 
 @app.post("/api/v1/capture")
-def capture_payment(req: CaptureRequest):
-    """【Step 3: 現場タスクプレ検収完了 ➔ Stripe本決済確定】"""
+def capture_payment(req: CaptureRequest, client_id: str = Depends(verify_api_key)):
     try:
         intent = stripe.PaymentIntent.retrieve(req.payment_intent_id)
         captured_intent = stripe.PaymentIntent.capture(req.payment_intent_id)
 
         DatabaseRepository.add_log("CAPTURED", {
             "payment_intent_id": captured_intent.id,
-            "captured_amount_usd": captured_intent.amount / 100.0
+            "captured_amount_usd": captured_intent.amount / 100.0,
+            "client_id": client_id
         })
 
         return {
@@ -439,15 +351,18 @@ def capture_payment(req: CaptureRequest):
 
 
 @app.post("/mcp/v1/tools/call")
-def mcp_tool_call(req: MCPToolCallRequest, background_tasks: BackgroundTasks):
-    """【MCP アダプター】Claude / OpenAI Agents 向けネイティブ Tool 呼び出し」"""
+def mcp_tool_call(
+    req: MCPToolCallRequest,
+    background_tasks: BackgroundTasks,
+    client_id: str = Depends(verify_api_key)
+):
     if req.name == "dispatch_physical_execution":
         intent = req.arguments.get("intent", "")
         tier = req.arguments.get("tier", "express")
         ground_cost = req.arguments.get("estimated_cost_jpy", 5000)
 
         quote_req = QuoteRequest(intent=intent, tier=SLATier(tier), estimated_ground_cost_jpy=ground_cost)
-        res = create_quote(quote_req, background_tasks)
+        res = create_quote(quote_req, background_tasks, client_id)
         return {
             "content": [
                 {
