@@ -1,3 +1,136 @@
+import os
+import json
+import sqlite3
+import uuid
+import stripe
+from typing import List, Dict, Any, Optional
+from enum import Enum
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Security, Depends
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel, Field
+from google import genai
+from google.genai import types
+
+# ====================================================
+# 1. Environment & Infrastructure Initialization
+# ====================================================
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+MASTER_API_KEY = os.getenv("GATEWAY_X_API_KEY", "gwx_live_secret_key_9988")
+
+stripe.api_key = STRIPE_SECRET_KEY
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+app = FastAPI(
+    title="Gateway X-OS",
+    version="3.2.0",
+    description="Physical Execution API Gateway for Autonomous AI Agents & Quant Platforms"
+)
+
+DB_FILE = "gateway.db"
+
+# ====================================================
+# 2. Security & API Key Middleware (Ken & Jeff Design)
+# ====================================================
+api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+
+def verify_api_key(api_key: str = Security(api_key_header)):
+    """API Key verification middleware for client authentication"""
+    if not api_key:
+        # Fallback to check default bearer or header for convenience
+        return "anonymous_client"
+    if api_key != MASTER_API_KEY and not api_key.startswith("gwx_"):
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "unauthorized", "message": "Invalid or missing Gateway X API Key"}
+        )
+    return api_key
+
+# ====================================================
+# 3. Persistence Layer (SQLite WAL & Lock Defense)
+# ====================================================
+
+def get_db_connection():
+    """SQLite connection with lock protection"""
+    conn = sqlite3.connect(DB_FILE, timeout=10.0)
+    return conn
+
+def init_db():
+    """Initialize database tables and enable WAL mode"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS growth_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS learned_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_text TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS quotes (
+            quote_id TEXT PRIMARY KEY,
+            intent TEXT NOT NULL,
+            tier TEXT NOT NULL,
+            price_usd REAL NOT NULL,
+            estimated_cost_jpy INT NOT NULL,
+            margin_percent REAL NOT NULL,
+            status TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+
+class DatabaseRepository:
+    """Repository Access Object"""
+    
+    @staticmethod
+    def add_log(event_type: str, payload: Dict[str, Any]):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO growth_logs (event_type, payload) VALUES (?, ?)",
+            (event_type, json.dumps(payload, ensure_ascii=False))
+        )
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def get_declined_logs() -> List[Dict[str, Any]]:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT payload FROM growth_logs WHERE event_type = 'DECLINED'")
+        rows = cursor.fetchall()
+        conn.close()
+        return [json.loads(r[0]) for r in rows]
+
+    @staticmethod
+    def add_learned_rule(rule_text: str):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO learned_rules (rule_text) VALUES (?)", (rule_text,))
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def get_learned_rules() -> List[str]:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT rule_text FROM learned_rules ORDER BY id DESC LIMIT 10")
