@@ -1,7 +1,7 @@
 # app/orchestrator/master.py
 import uuid
 from app.core.vetting import VettingEngine
-from app.core.pricing import PricingEngine
+from app.core.pricing import DynamicPricingEngine as PricingEngine
 from app.db.repository import DatabaseRepository
 
 class MasterOrchestrator:
