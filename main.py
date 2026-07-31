@@ -1,13 +1,19 @@
 import os
 import uvicorn
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
-# モジュール群のインポート (提示いただいた構成に対応)
+# --- クラス名の不一致を吸収するためのインポート設定 ---
 from app.core.vetting import VettingEngine
-from app.core.pricing import DynamicPricingEngine
+
+# DynamicPricingEngine を PricingEngine としてインポート（名前の互換性を確保）
+try:
+    from app.core.pricing import DynamicPricingEngine as PricingEngine
+except ImportError:
+    from app.core.pricing import PricingEngine
+
 from app.orchestrator.master import MasterOrchestrator
 from app.api.v1_feedback import router as feedback_router
 
@@ -17,15 +23,14 @@ app = FastAPI(
     description="Physical Execution Gateway for Autonomous AI Agents"
 )
 
-# 各エンジンの初期化
+# エンジン初期化
 vetting_engine = VettingEngine()
-pricing_engine = DynamicPricingEngine()
+pricing_engine = PricingEngine()
 orchestrator = MasterOrchestrator()
 
-# フィードバックAPIのルーター組み込み
+# ルーター追加
 app.include_router(feedback_router, prefix="/mcp/v1", tags=["Feedback"])
 
-# --- データモデル定義 ---
 class MCPToolCallRequest(BaseModel):
     name: str
     arguments: Dict[str, Any]
@@ -35,8 +40,7 @@ async def root():
     return {
         "status": "online",
         "system": "Gateway X-OS",
-        "version": "3.2.0",
-        "architecture": "4-Tier Event-Driven Orchestration"
+        "version": "3.2.0"
     }
 
 @app.post("/mcp/v1/tools/call")
@@ -44,10 +48,6 @@ async def handle_mcp_tool_call(
     request: MCPToolCallRequest,
     background_tasks: BackgroundTasks
 ):
-    """
-    海外AIエージェントからのMCPリクエストを受け取り、
-    Vetting(審査) -> Pricing(価格設定) -> Orchestration(統括) へルーティング
-    """
     if request.name != "dispatch_physical_execution":
         raise HTTPException(status_code=400, detail=f"Unknown tool name: {request.name}")
 
@@ -57,10 +57,9 @@ async def handle_mcp_tool_call(
     estimated_cost_jpy = args.get("estimated_cost_jpy", 5000)
     client_id = args.get("client_id", "anonymous_ai")
 
-    # 1. 安全性・コンプライアンス審査 (Vetting)
+    # 1. Vetting
     vetting_result = await vetting_engine.evaluate(intent=intent, client_id=client_id)
     if not vetting_result.passed:
-        # 防衛フィルター検知（即時拒絶 & 監査ログ永続化）
         background_tasks.add_task(orchestrator.log_security_alert, client_id, intent, vetting_result.reason)
         return JSONResponse(
             status_code=403,
@@ -71,13 +70,13 @@ async def handle_mcp_tool_call(
             }
         )
 
-    # 2. 動的価格計算 (Dynamic Pricing: 83% High-Margin Lock)
+    # 2. Pricing
     quote = pricing_engine.calculate_quote(
         estimated_cost_jpy=estimated_cost_jpy,
         tier=tier
     )
 
-    # 3. Master Orchestrator によるイベント登録・タスク発行
+    # 3. Master Orchestrator
     dispatch_event = await orchestrator.create_execution_event(
         client_id=client_id,
         intent=intent,
