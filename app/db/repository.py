@@ -2,12 +2,11 @@ import sqlite3
 import asyncio
 import json
 from typing import Dict, Any, List, Optional
-from datetime import datetime
 
 
 class DatabaseRepository:
     """
-    Gateway X-OS Phase 2 統合データベースリポジトリ
+    Gateway X-OS 統合データベースリポジトリ
     SQLite (WALモード) を使用し、非同期・高並列での高速永続化・ログ・学習ルールの保存を担う
     """
 
@@ -18,17 +17,14 @@ class DatabaseRepository:
     def _get_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        # 高速並行処理のための WAL (Write-Ahead Logging) モード有効化
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         return conn
 
     def _init_db(self):
-        """テーブルの初期化"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
-            # 1. 見積もり・タスク発行テーブル (Quotes & Tasks)
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS quotes (
                 quote_id TEXT PRIMARY KEY,
@@ -43,7 +39,6 @@ class DatabaseRepository:
             )
             """)
 
-            # 2. Vetting（審査・遮断）監査ログテーブル
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS vetting_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,7 +51,6 @@ class DatabaseRepository:
             )
             """)
 
-            # 3. 自律学習ルール・最適化ナレッジテーブル
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS learned_rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,7 +61,6 @@ class DatabaseRepository:
             )
             """)
 
-            # 4. クライアントAIフィードバックテーブル
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS feedback_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,15 +72,25 @@ class DatabaseRepository:
             )
             """)
 
+            # 汎用イベントログ（DECLINED/QUOTED等の状態遷移を一元管理）
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS event_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT,
+                intent TEXT,
+                detail TEXT,
+                client_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
+
             conn.commit()
 
-    # --- 非同期ヘルパー（スレッドプールで同期SQLite呼び出しを実行） ---
     async def save_quote(self, quote_data: Dict[str, Any]) -> None:
-        """見積もり・タスクの保存"""
         def _execute():
             with self._get_connection() as conn:
                 conn.execute("""
-                INSERT OR REPLACE INTO quotes 
+                INSERT OR REPLACE INTO quotes
                 (quote_id, client_id, intent, tier, price_usd, cost_jpy, margin_percent, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
@@ -97,14 +100,13 @@ class DatabaseRepository:
                     quote_data.get("tier", "economy"),
                     quote_data.get("price_usd", 0.0),
                     quote_data.get("cost_jpy", 0.0),
-                    quote_data.get("margin_percent", 0.83),
+                    quote_data.get("margin_percent", 0.0),
                     quote_data.get("status", "QUOTED")
                 ))
                 conn.commit()
         await asyncio.to_thread(_execute)
 
     async def save_vetting_log(self, vetting_data: Dict[str, Any]) -> None:
-        """Vetting審査結果・遮断ログの保存"""
         def _execute():
             with self._get_connection() as conn:
                 flagged = json.dumps(vetting_data.get("flagged_keywords", []))
@@ -122,7 +124,6 @@ class DatabaseRepository:
         await asyncio.to_thread(_execute)
 
     async def save_learned_rule(self, rule_summary: str, source: str = "feedback_loop") -> None:
-        """AI自律学習によって導出されたルールの蓄積"""
         def _execute():
             with self._get_connection() as conn:
                 conn.execute("""
@@ -133,7 +134,6 @@ class DatabaseRepository:
         await asyncio.to_thread(_execute)
 
     async def get_learned_rules(self) -> List[str]:
-        """蓄積された全学習ルールの取得"""
         def _execute():
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -142,18 +142,37 @@ class DatabaseRepository:
                 return [row["rule_summary"] for row in rows]
         return await asyncio.to_thread(_execute)
 
-    async def save_feedback(self, feedback_data: Dict[str, Any]) -> None:
-        """クライアントAIからのフィードバック保存"""
+    async def save_feedback(
+        self,
+        task_id: str,
+        client_id: str,
+        rating: int,
+        feedback_text: str
+    ) -> None:
+        """クライアントAIからのフィードバック保存（位置引数版）"""
         def _execute():
             with self._get_connection() as conn:
                 conn.execute("""
                 INSERT INTO feedback_logs (quote_id, client_id, rating, feedback_text)
                 VALUES (?, ?, ?, ?)
-                """, (
-                    feedback_data.get("quote_id", ""),
-                    feedback_data.get("client_id", "anonymous"),
-                    feedback_data.get("rating", 5),
-                    feedback_data.get("feedback_text", "")
-                ))
+                """, (task_id, client_id, rating, feedback_text))
+                conn.commit()
+        await asyncio.to_thread(_execute)
+
+    async def optimize_instructions_from_feedback(self, feedback_text: str) -> None:
+        """フィードバックからシステムプロンプト/ナレッジへの還元（現状はルール化して保存するのみ）"""
+        if not feedback_text:
+            return
+        summary = feedback_text.strip()[:280]
+        await self.save_learned_rule(summary, source="feedback_loop")
+
+    async def log_event(self, event_type: str, intent: str, detail: str, client_id: str = "anonymous") -> None:
+        """MasterOrchestratorからの汎用イベントログ"""
+        def _execute():
+            with self._get_connection() as conn:
+                conn.execute("""
+                INSERT INTO event_logs (event_type, intent, detail, client_id)
+                VALUES (?, ?, ?, ?)
+                """, (event_type, intent, detail, client_id))
                 conn.commit()
         await asyncio.to_thread(_execute)
