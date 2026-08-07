@@ -1,89 +1,78 @@
 import os
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
-import httpx
+from google import genai
+from google.genai import types
 
 from sales import SalesRepository
 
 
 class StrategyPlanner:
     """
-    StrategyPlanner: httpxでChatGPT(批判役)とClaude(提案役)を直接叩いて討論させる。
+    StrategyPlanner: google-genai(Gemini API)を使い、2つの人格(提案担当/批判担当)に
+    自己討論させる。
 
-    提案(Claude) -> 批判(ChatGPT) -> 修正(Claude) を1ラウンドとし、最大 max_rounds 回繰り返す。
-    ChatGPT側が「これ以上の問題なし」と判断した場合はCONVERGEDを返し、そこで討論を打ち切る。
-    max_rounds に達しても収束しない場合は、本来StrategyExecutorが行う保留判定を暫定的にここで
-    代行する(Executor実装後はそちらに移す)。
+    提案(Proposer) -> 批判(Critic) -> 修正(Proposer) を1ラウンドとし、最大 max_rounds 回
+    繰り返す。Critic側が「これ以上の問題なし」と判断した場合はCONVERGEDを返し、そこで
+    討論を打ち切る。max_rounds に達しても収束しない場合は、本来StrategyExecutorが行う
+    保留判定を暫定的にここで代行する(Executor実装後はそちらに移す)。
 
-    SDK(openai/anthropic)を使わずhttpxで直叩きしているのは、requirements.txtに両SDKが
-    含まれておらず、依存を増やさない方針にしたため。
+    当初は「ChatGPTとClaude Code、異なるモデル同士の討論」という設計だったが、既にGemini
+    APIキー(有料プラン)を保有しており、requirements.txtにも google-genai が既に含まれて
+    いるため、新規にOpenAI/Anthropicのサインアップ・キー管理コストをかけずGemini単体での
+    2人格自己討論に変更した。トレードオフとして、批判役が別モデルほど厳しくならない
+    (同じモデルの癖を引きずる)リスクがあるため、プロンプトで人格をはっきり分けている。
     """
-
-    OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-    ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-    ANTHROPIC_VERSION = "2023-06-01"
 
     def __init__(
         self,
         sales_repo: SalesRepository,
-        openai_api_key: Optional[str] = None,
-        anthropic_api_key: Optional[str] = None,
+        api_key: Optional[str] = None,
+        model: str = "gemini-3.6-flash",
         max_rounds: int = 3,
-        request_timeout: float = 60.0,
     ):
         self.sales_repo = sales_repo
-        self.openai_api_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
-        self.anthropic_api_key = anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
+        # google-genai は GEMINI_API_KEY / GOOGLE_API_KEY 環境変数を自動で拾うが、
+        # 明示的に渡された場合はそちらを優先する
+        api_key = api_key or os.environ.get("GEMINI_API_KEY")
+        self.client = genai.Client(api_key=api_key) if api_key else genai.Client()
+        self.model = model
         self.max_rounds = max_rounds
-        self.request_timeout = request_timeout
 
-    # ---------- 各APIの直叩き ----------
+    # ---------- Gemini呼び出し(人格ごとにsystem_instructionを変える) ----------
 
-    async def _call_claude(self, prompt: str) -> str:
-        if not self.anthropic_api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY が設定されていません")
-        headers = {
-            "x-api-key": self.anthropic_api_key,
-            "anthropic-version": self.ANTHROPIC_VERSION,
-            "content-type": "application/json",
-        }
-        payload = {
-            "model": "claude-sonnet-4-6",
-            "max_tokens": 1024,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        async with httpx.AsyncClient(timeout=self.request_timeout) as client:
-            resp = await client.post(self.ANTHROPIC_API_URL, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            return "".join(
-                block.get("text", "")
-                for block in data.get("content", [])
-                if block.get("type") == "text"
-            )
+    async def _call_gemini(self, prompt: str, system_instruction: str) -> str:
+        response = await self.client.aio.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=types.GenerateContentConfig(system_instruction=system_instruction),
+        )
+        return response.text or ""
 
-    async def _call_chatgpt(self, prompt: str) -> str:
-        if not self.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY が設定されていません")
-        headers = {
-            "Authorization": f"Bearer {self.openai_api_key}",
-            "content-type": "application/json",
-        }
-        payload = {
-            "model": "gpt-4.1",
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        async with httpx.AsyncClient(timeout=self.request_timeout) as client:
-            resp = await client.post(self.OPENAI_API_URL, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
+    async def _call_proposer(self, prompt: str) -> str:
+        return await self._call_gemini(
+            prompt,
+            system_instruction=(
+                "あなたはB2B調達エージェント向けサービス「Gateway X」の営業戦略立案者(推進派)です。"
+                "実行可能で具体的な戦略案を前向きに提案してください。"
+            ),
+        )
+
+    async def _call_critic(self, prompt: str) -> str:
+        return await self._call_gemini(
+            prompt,
+            system_instruction=(
+                "あなたはGateway Xの営業戦略をレビューする批判担当(懐疑派)です。"
+                "提案担当とは独立した立場で、実行可能性・法的リスク・費用対効果の観点から"
+                "厳しく問題点を指摘してください。提案担当に同調しないでください。"
+            ),
+        )
 
     # ---------- 討論ループ本体 ----------
 
     async def run_debate_cycle(self, topic: str, context: str = "") -> Dict[str, Any]:
         """
-        topic: 議題(例: 「新規セグロメントAへの営業を強化すべきか」)
+        topic: 議題(例: 「新規セグメントAへの営業を強化すべきか」)
         context: 制約情報(法的リスク・実装フェーズ・API可用性等、呼び出し側から渡す)
         """
         past_cycles = await self.sales_repo.get_recent_cycles(limit=5)
@@ -93,13 +82,12 @@ class StrategyPlanner:
         ) or "(過去事例なし)"
 
         proposal_prompt = (
-            "あなたはB2B調達エージェント向けサービス「Gateway X」の営業戦略立案者です。\n"
             f"議題: {topic}\n"
             f"制約・背景情報: {context}\n"
             f"過去の戦略サイクルの結果:\n{past_summary}\n\n"
             "上記を踏まえ、具体的な営業戦略案を1つ提案してください。"
         )
-        proposal = await self._call_claude(proposal_prompt)
+        proposal = await self._call_proposer(proposal_prompt)
         cycle_id = await self.sales_repo.start_strategy_cycle(proposal)
 
         converged = False
@@ -114,7 +102,7 @@ class StrategyPlanner:
                 "回答の最初の行に厳密に「CONVERGED」とだけ書いてください。\n\n"
                 f"戦略案:\n{revision}"
             )
-            critique = await self._call_chatgpt(critique_prompt)
+            critique = await self._call_critic(critique_prompt)
 
             if critique.strip().startswith("CONVERGED"):
                 converged = True
@@ -127,7 +115,7 @@ class StrategyPlanner:
                 f"元の案:\n{revision}\n\n"
                 "批判を踏まえて修正した戦略案を提示してください。"
             )
-            revision = await self._call_claude(revision_prompt)
+            revision = await self._call_proposer(revision_prompt)
             await self.sales_repo.update_debate_round(cycle_id, round_count, critique, revision)
 
         if not converged:
