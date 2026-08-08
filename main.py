@@ -9,6 +9,7 @@ from app.core.pricing import PricingEngine
 from app.orchestrator.master import MasterOrchestrator
 from app.api.v1_feedback import router as feedback_router
 from app.sales.auth_gateway import create_auth_gateway_router
+from app.sales.concierge_service import create_concierge_router
 
 app = FastAPI(
     title="Gateway X-OS API Gateway",
@@ -22,6 +23,11 @@ app.include_router(feedback_router, prefix="/mcp/v1", tags=["Feedback"])
 # AuthGatewayの単体ルーター(/gateway/route)。orchestrator内部で使っているsales_repoと
 # 同じインスタンスを渡すことで、accountsテーブルの状態を共有する。
 app.include_router(create_auth_gateway_router(orchestrator.sales_repo))
+# ConciergeServiceの対話エンドポイント(/concierge/message)。自由記述の依頼から
+# intent/tier/estimated_cost_jpyを抽出し、不足があれば聞き返す質問を返す。
+# クライアントAIはここで情報が揃うまでやり取りし、揃った結果を
+# /mcp/v1/tools/call の arguments としてそのまま渡す想定。
+app.include_router(create_concierge_router(orchestrator.concierge_service))
 
 
 class MCPToolCallRequest(BaseModel):
