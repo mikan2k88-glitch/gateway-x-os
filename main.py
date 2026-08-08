@@ -4,23 +4,24 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Dict, Any
-
 from app.core.vetting import VettingEngine
 from app.core.pricing import PricingEngine
 from app.orchestrator.master import MasterOrchestrator
 from app.api.v1_feedback import router as feedback_router
+from app.sales.auth_gateway import create_auth_gateway_router
 
 app = FastAPI(
     title="Gateway X-OS API Gateway",
     version="3.2.0",
     description="Physical Execution Gateway for Autonomous AI Agents"
 )
-
 vetting_engine = VettingEngine()
 pricing_engine = PricingEngine()
 orchestrator = MasterOrchestrator()
-
 app.include_router(feedback_router, prefix="/mcp/v1", tags=["Feedback"])
+# AuthGatewayの単体ルーター(/gateway/route)。orchestrator内部で使っているsales_repoと
+# 同じインスタンスを渡すことで、accountsテーブルの状態を共有する。
+app.include_router(create_auth_gateway_router(orchestrator.sales_repo))
 
 
 class MCPToolCallRequest(BaseModel):
@@ -51,6 +52,17 @@ async def handle_mcp_tool_call(
     estimated_cost_jpy = args.get("estimated_cost_jpy", 5000)
     client_id = args.get("client_id", "anonymous_ai")
 
+    # AuthGatewayによるルーティング判定(routine/concierge)。
+    # ConciergeService未実装のため、現時点ではフローをブロックせず、
+    # レスポンスに含めて可視化するだけに留める(ConciergeService実装時に、
+    # route == "concierge" の場合はここで処理を分岐させる)。
+    route_info = await orchestrator.auth_gateway.decide_route(client_id, intent, tier)
+    if route_info["route"] == "concierge":
+        # 初回・非定型パターンの場合はConciergeServiceにリードとして記録させる。
+        # 現時点ではフローはブロックせず、通常のVetting/Pricingに進む
+        # (要件明確化ダイアログは未実装のため、ここでは記録と案内メッセージ生成のみ)
+        await orchestrator.concierge_service.handle_first_contact(client_id, intent, tier)
+
     # 0. Tier availability check (tactical は未実装のため拒否)
     tier_check = VettingEngine.check_tier_availability(tier)
     if not tier_check["available"]:
@@ -80,7 +92,7 @@ async def handle_mcp_tool_call(
         tier=tier
     )
 
-    # 3. Master Orchestrator（永続化）
+    # 3. Master Orchestrator（永続化。この中でAuthGatewayの承認カウントも加算される）
     dispatch_event = await orchestrator.create_execution_event(
         client_id=client_id,
         intent=intent,
@@ -97,7 +109,8 @@ async def handle_mcp_tool_call(
         "margin_percent": quote["margin_percent"],
         "currency": "USD",
         "vetting_assessment": vetting_result,
-        "orchestration_event_id": dispatch_event["event_id"]
+        "orchestration_event_id": dispatch_event["event_id"],
+        "routing": route_info["route"],  # 'routine' | 'concierge'(現時点では表示のみ)
     }
 
 
