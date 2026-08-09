@@ -17,6 +17,9 @@ class SalesRepository:
     - strategy_cycles: StrategyPlanner の討論サイクル(提案/批判/修正)と、
       StrategyExecutor の判断結果・却下理由を保存する
     - capacity_alerts: 供給キャパシティ逼迫のログ(タイミーワーカー等の稼働可能量 vs 需要)
+    - quote_attempts: カーディング攻撃検知用。全ての見積発行試行(金額・時刻)を記録し、
+      短時間に少額の見積を大量発行するパターン(盗難カードの有効性検証によく使われる手口)
+      を検知するために使う
     """
 
     def __init__(self, db_path: str = "gateway_x.db"):
@@ -87,6 +90,16 @@ class SalesRepository:
                 demand REAL,
                 alert_level TEXT,
                 action_taken TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
+
+            # カーディング攻撃検知用: 見積発行試行のログ
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS quote_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id TEXT,
+                price_usd REAL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """)
@@ -260,4 +273,35 @@ class SalesRepository:
                 """, (supply_channel,))
                 row = cursor.fetchone()
                 return dict(row) if row else None
+        return await asyncio.to_thread(_execute)
+
+    # ---------- quote_attempts / カーディング検知 ----------
+
+    async def log_quote_attempt(self, client_id: str, price_usd: float) -> None:
+        def _execute():
+            with self._get_connection() as conn:
+                conn.execute("""
+                INSERT INTO quote_attempts (client_id, price_usd) VALUES (?, ?)
+                """, (client_id, price_usd))
+                conn.commit()
+        await asyncio.to_thread(_execute)
+
+    async def count_recent_small_quotes(
+        self, client_id: str, window_seconds: float, price_threshold_usd: float
+    ) -> int:
+        """
+        直近 window_seconds 秒以内に発行された、price_threshold_usd 円未満の
+        見積試行の件数を返す。カーディング攻撃(少額見積の大量発行)の検知に使う。
+        """
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                SELECT COUNT(*) as cnt FROM quote_attempts
+                WHERE client_id = ?
+                  AND price_usd < ?
+                  AND created_at >= datetime('now', ?)
+                """, (client_id, price_threshold_usd, f"-{window_seconds} seconds"))
+                row = cursor.fetchone()
+                return row["cnt"] if row else 0
         return await asyncio.to_thread(_execute)
