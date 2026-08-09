@@ -10,6 +10,16 @@ from app.orchestrator.master import MasterOrchestrator
 from app.api.v1_feedback import router as feedback_router
 from app.sales.auth_gateway import create_auth_gateway_router
 from app.sales.concierge_service import create_concierge_router
+from app.core.rate_limiter import RateLimiter
+
+# レートリミッター設定: 1クライアントあたり60秒間に20リクエストまで(DoS対策)
+RATE_LIMIT_MAX_REQUESTS = 20
+RATE_LIMIT_WINDOW_SECONDS = 60.0
+
+# カーディング攻撃検知設定: 5分以内に$5未満の見積が5件以上ある場合は疑わしいパターンとみなす
+CARDING_WINDOW_SECONDS = 300.0
+CARDING_PRICE_THRESHOLD_USD = 5.0
+CARDING_MAX_SMALL_QUOTES = 5
 
 app = FastAPI(
     title="Gateway X-OS API Gateway",
@@ -19,6 +29,7 @@ app = FastAPI(
 vetting_engine = VettingEngine()
 pricing_engine = PricingEngine()
 orchestrator = MasterOrchestrator()
+rate_limiter = RateLimiter()
 app.include_router(feedback_router, prefix="/mcp/v1", tags=["Feedback"])
 # AuthGatewayの単体ルーター(/gateway/route)。orchestrator内部で使っているsales_repoと
 # 同じインスタンスを渡すことで、accountsテーブルの状態を共有する。
@@ -64,6 +75,16 @@ async def handle_mcp_tool_call(
     estimated_cost_jpy = args.get("estimated_cost_jpy", 5000)
     client_id = args.get("client_id", "anonymous_ai")
 
+    # レートリミッター: 海外AIクライアントの無限連打(DoS)を防止する一次防御
+    if not rate_limiter.check(client_id, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS):
+        return JSONResponse(
+            status_code=429,
+            content={
+                "status": "RATE_LIMITED",
+                "reason": f"Too many requests. Limit: {RATE_LIMIT_MAX_REQUESTS} per {int(RATE_LIMIT_WINDOW_SECONDS)}s.",
+            }
+        )
+
     # AuthGatewayによるルーティング判定(routine/concierge)。
     # ConciergeService未実装のため、現時点ではフローをブロックせず、
     # レスポンスに含めて可視化するだけに留める(ConciergeService実装時に、
@@ -103,6 +124,24 @@ async def handle_mcp_tool_call(
         estimated_cost_jpy=estimated_cost_jpy,
         tier=tier
     )
+
+    # 2.5 カーディング攻撃検知: 少額見積の大量発行パターンをチェック
+    # (盗難カードの有効性を「与信が通るか」だけで検証する手口への対策)
+    await orchestrator.sales_repo.log_quote_attempt(client_id, quote["price_usd"])
+    small_quote_count = await orchestrator.sales_repo.count_recent_small_quotes(
+        client_id, CARDING_WINDOW_SECONDS, CARDING_PRICE_THRESHOLD_USD
+    )
+    if small_quote_count >= CARDING_MAX_SMALL_QUOTES:
+        reason = (
+            f"Suspicious pattern: {small_quote_count} quotes under "
+            f"${CARDING_PRICE_THRESHOLD_USD} within {int(CARDING_WINDOW_SECONDS)}s "
+            f"(possible carding attempt)."
+        )
+        background_tasks.add_task(orchestrator.log_security_alert, client_id, intent, reason)
+        return JSONResponse(
+            status_code=403,
+            content={"status": "FLAGGED_FOR_REVIEW", "reason": reason}
+        )
 
     # 3. Master Orchestrator（永続化。この中でAuthGatewayの承認カウントも加算される）
     dispatch_event = await orchestrator.create_execution_event(
