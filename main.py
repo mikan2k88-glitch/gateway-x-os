@@ -35,6 +35,12 @@ class MCPToolCallRequest(BaseModel):
     arguments: Dict[str, Any]
 
 
+class ExecuteRequest(BaseModel):
+    client_id: str
+    quote: Dict[str, Any]
+    payment_method_id: str = None
+
+
 @app.get("/")
 async def root():
     return {
@@ -118,6 +124,21 @@ async def handle_mcp_tool_call(
         "orchestration_event_id": dispatch_event["event_id"],
         "routing": route_info["route"],  # 'routine' | 'concierge'(現時点では表示のみ)
     }
+
+
+@app.post("/mcp/v1/tools/execute")
+async def handle_execute(request: ExecuteRequest):
+    """
+    /mcp/v1/tools/call が返した見積(quote)を受け取り、
+    Phase A(与信仮押さえ) → 現場ルーティング/プレ検収 → Phase B(売上確定) を実行する。
+    決済(Stripe)が絡むため、見積発行(QUOTED)とは別エンドポイントに分離している。
+    """
+    result = await orchestrator.execute_physical_task(
+        client_id=request.client_id,
+        quote=request.quote,
+        payment_method_id=request.payment_method_id,
+    )
+    return result
 
 
 if __name__ == "__main__":
