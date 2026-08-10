@@ -1,6 +1,6 @@
 import os
 import uvicorn
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Dict, Any
@@ -50,6 +50,7 @@ class ExecuteRequest(BaseModel):
     client_id: str
     quote: Dict[str, Any]
     payment_method_id: str = None
+    worker_line_user_id: str = None  # 指定があればLINE経由の非同期フローに切り替わる
 
 
 @app.get("/")
@@ -168,16 +169,92 @@ async def handle_mcp_tool_call(
 @app.post("/mcp/v1/tools/execute")
 async def handle_execute(request: ExecuteRequest):
     """
-    /mcp/v1/tools/call が返した見積(quote)を受け取り、
-    Phase A(与信仮押さえ) → 現場ルーティング/プレ検収 → Phase B(売上確定) を実行する。
-    決済(Stripe)が絡むため、見積発行(QUOTED)とは別エンドポイントに分離している。
+    /mcp/v1/tools/call が返した見積(quote)を受け取り、決済(Auth)を行う。
+
+    worker_line_user_id が指定されている場合: LINEでワーカーへタスク通知し、
+    status: "DISPATCHED" を返す(Captureは後でLINE Webhook経由で非同期に行われる)。
+    クライアントAIは返ってきた execution_id で GET /mcp/v1/tools/execute/{execution_id}
+    をポーリングして進捗を確認できる。
+
+    worker_line_user_id が無い場合: レガシーの同期実行パス(execute_physical_task)を使う。
     """
-    result = await orchestrator.execute_physical_task(
-        client_id=request.client_id,
-        quote=request.quote,
-        payment_method_id=request.payment_method_id,
-    )
+    if request.worker_line_user_id:
+        result = await orchestrator.dispatch_to_worker(
+            client_id=request.client_id,
+            quote=request.quote,
+            worker_line_user_id=request.worker_line_user_id,
+            payment_method_id=request.payment_method_id,
+        )
+    else:
+        result = await orchestrator.execute_physical_task(
+            client_id=request.client_id,
+            quote=request.quote,
+            payment_method_id=request.payment_method_id,
+        )
     return result
+
+
+@app.get("/mcp/v1/tools/execute/{execution_id}")
+async def get_execution_status(execution_id: str):
+    """クライアントAIがDISPATCHED後の進捗をポーリングするためのエンドポイント"""
+    dispatch = await orchestrator.execution_repo.get_dispatch(execution_id)
+    if dispatch is None:
+        raise HTTPException(status_code=404, detail="execution_id not found")
+    return dispatch
+
+
+@app.post("/line/webhook")
+async def line_webhook(request: Request):
+    """
+    LINE Messaging APIからのWebhook。ワーカーが「完了 exec_xxx」/「失敗 exec_xxx」
+    と返信した際にここへ届く。署名を検証したうえで、対応する派遣(dispatch)を
+    完了/失敗として処理する。
+    """
+    body = await request.body()
+    signature = request.headers.get("X-Line-Signature", "")
+    if not orchestrator.line_service.verify_signature(body, signature):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    payload = await request.json()
+    results = []
+    for event in payload.get("events", []):
+        if event.get("type") != "message" or event.get("message", {}).get("type") != "text":
+            continue
+
+        text = event["message"]["text"].strip()
+        line_user_id = event.get("source", {}).get("userId", "")
+        reply_token = event.get("replyToken", "")
+
+        # メッセージ本文にexecution_idが含まれていればそれを優先し、
+        # 無ければそのワーカーの直近のDISPATCHED案件を対象にする(簡易フォールバック)
+        execution_id = None
+        for token in text.split():
+            if token.startswith("exec_"):
+                execution_id = token
+                break
+        if execution_id is None:
+            latest = await orchestrator.execution_repo.find_latest_dispatched_by_worker(line_user_id)
+            execution_id = latest["execution_id"] if latest else None
+
+        if execution_id is None:
+            continue
+
+        if "完了" in text:
+            result = await orchestrator.complete_dispatch(execution_id, "completed")
+            reply_text = "報告ありがとうございます。完了処理をしました。" if result["status"] == "COMPLETED" \
+                else f"処理でエラーが発生しました({result['status']})。運営にご連絡ください。"
+        elif "失敗" in text or "できません" in text:
+            result = await orchestrator.complete_dispatch(execution_id, "failed")
+            reply_text = "承知しました。与信を解放しました。ご対応ありがとうございました。"
+        else:
+            result = None
+            reply_text = "「完了」または「失敗」に管理番号を添えて返信してください。"
+
+        if reply_token:
+            await orchestrator.line_service.reply_message(reply_token, reply_text)
+        results.append(result)
+
+    return {"status": "ok", "processed": len(results)}
 
 
 if __name__ == "__main__":
