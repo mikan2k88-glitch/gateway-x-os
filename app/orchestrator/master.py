@@ -161,6 +161,66 @@ class MasterOrchestrator:
             await self.execution_repo.update_status(execution_id, "FAILED")
             return {"status": "FAILED", "execution_id": execution_id, "payment_canceled": cancel_result["success"]}
 
+    async def handle_chargeback(self, dispute_id: str, payment_intent_id: str) -> Dict[str, Any]:
+        """
+        Stripeからのdispute(チャージバック)Webhook受信時に呼ぶ。
+        dispute_idは証拠提出先の特定に、payment_intent_idはこちら側の監査ログ
+        (dispatchレコード)の逆引きに使う。
+
+        「サービスは実際に完了報告(LINE)を受けて提供済みである」ことを示す証拠を
+        自動的に組み立ててStripeへ提出する。completed以外(FAILED等)のdispatchや、
+        そもそも見つからない場合は、正当な異議申立ての可能性があるため自動証拠提出は
+        行わず、要人力確認としてログのみ残す。
+        """
+        dispatch = await self.execution_repo.get_dispatch_by_payment_intent(payment_intent_id)
+        if dispatch is None:
+            await self.db.log_event(
+                "CHARGEBACK_UNRESOLVED", "", f"payment_intent={payment_intent_id}: dispatch not found", "unknown"
+            )
+            return {"status": "NO_RECORD", "payment_intent_id": payment_intent_id}
+
+        await self.db.log_event(
+            "CHARGEBACK_RECEIVED", dispatch["intent"], f"execution_id={dispatch['execution_id']}",
+            dispatch["client_id"]
+        )
+
+        if dispatch["status"] != "COMPLETED":
+            # 完了報告が無いままの注文へのチャージバックは、こちら側にも非がある可能性があるため
+            # 自動反論はせず、要人力レビューとして記録するに留める
+            await self.db.log_event(
+                "CHARGEBACK_NEEDS_MANUAL_REVIEW", dispatch["intent"],
+                f"execution_id={dispatch['execution_id']}, dispatch_status={dispatch['status']}",
+                dispatch["client_id"]
+            )
+            return {
+                "status": "NEEDS_MANUAL_REVIEW", "payment_intent_id": payment_intent_id,
+                "execution_id": dispatch["execution_id"], "dispatch_status": dispatch["status"],
+            }
+
+        # 完了報告(LINE経由)を受けて実際にCapture済みの注文 -> 自動で証拠を組み立てて提出
+        evidence_text = (
+            f"Gateway X-OS 業務実行記録\n"
+            f"管理番号(execution_id): {dispatch['execution_id']}\n"
+            f"依頼内容: {dispatch['intent']}\n"
+            f"サービス階級(tier): {dispatch['tier']}\n"
+            f"担当ワーカーLINEユーザーID: {dispatch['worker_line_user_id'] or '(一斉通知、応答者が担当)'}\n"
+            f"完了報告受信日時(UTC): {dispatch['updated_at']}\n"
+            f"決済確定(Capture)日時: 完了報告受信と同時に自動確定\n"
+            f"本注文はLINE Messaging API経由でワーカーから明示的な完了報告を受けた後、"
+            f"システムが自動的に決済を確定させたものです。"
+        )
+        result = await self.stripe_service.submit_dispute_evidence(dispute_id, evidence_text)
+        await self.db.log_event(
+            "CHARGEBACK_EVIDENCE_SUBMITTED", dispatch["intent"],
+            f"execution_id={dispatch['execution_id']}, success={result.get('success')}",
+            dispatch["client_id"]
+        )
+        return {
+            "status": "EVIDENCE_SUBMITTED", "payment_intent_id": payment_intent_id,
+            "execution_id": dispatch["execution_id"], "evidence_text": evidence_text,
+            "submission_result": result,
+        }
+
     async def execute_physical_task(
         self, client_id: str, quote: Dict[str, Any], payment_method_id: Optional[str] = None
     ) -> Dict[str, Any]:
