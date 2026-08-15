@@ -175,18 +175,27 @@ async def handle_execute(request: ExecuteRequest):
     """
     /mcp/v1/tools/call が返した見積(quote)を受け取り、決済(Auth)を行う。
 
-    worker_line_user_id が指定されている場合: LINEでワーカーへタスク通知し、
-    status: "DISPATCHED" を返す(Captureは後でLINE Webhook経由で非同期に行われる)。
+    worker_line_user_id が指定されている場合: そのワーカー1人にLINE通知(個別指定)。
+    worker_line_user_id が無いが登録済みワーカーがいる場合: 登録済み全員に一斉通知(早い者勝ち)。
+    どちらの場合も status: "DISPATCHED" を返し、Captureは後でLINE Webhook経由で非同期に行われる。
     クライアントAIは返ってきた execution_id で GET /mcp/v1/tools/execute/{execution_id}
     をポーリングして進捗を確認できる。
 
-    worker_line_user_id が無い場合: レガシーの同期実行パス(execute_physical_task)を使う。
+    worker_line_user_id が無く、登録済みワーカーも1人もいない場合: レガシーの同期実行パス
+    (execute_physical_task、プレ検収は固定で合格扱い)にフォールバックする。
     """
     if request.worker_line_user_id:
         result = await orchestrator.dispatch_to_worker(
             client_id=request.client_id,
             quote=request.quote,
             worker_line_user_id=request.worker_line_user_id,
+            payment_method_id=request.payment_method_id,
+        )
+    elif await orchestrator.sales_repo.get_active_workers():
+        result = await orchestrator.dispatch_to_worker(
+            client_id=request.client_id,
+            quote=request.quote,
+            worker_line_user_id=None,
             payment_method_id=request.payment_method_id,
         )
     else:
@@ -232,6 +241,15 @@ async def line_webhook(request: Request):
         # ワーカー登録の仕組みがまだ無いため、動作確認用に受信したuserIdをログへ出力する。
         # Renderのログでこの行を探せば、worker_line_user_idに設定すべき値が分かる。
         logger.info(f"[LINE webhook] Received message from userId={line_user_id}: {text!r}")
+
+        # ワーカー登録: 「登録」というメッセージで自身のline_user_idをworkersテーブルに記録する
+        if text in ("登録", "ワーカー登録"):
+            await orchestrator.sales_repo.register_worker(line_user_id, display_name="")
+            reply_text = "ワーカー登録が完了しました。今後、新規タスクが発生した際に通知します。"
+            if reply_token:
+                await orchestrator.line_service.reply_message(reply_token, reply_text)
+            results.append({"status": "WORKER_REGISTERED", "line_user_id": line_user_id})
+            continue
 
         # メッセージ本文にexecution_idが含まれていればそれを優先し、
         # 無ければそのワーカーの直近のDISPATCHED案件を対象にする(簡易フォールバック)
