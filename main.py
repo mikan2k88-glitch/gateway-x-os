@@ -1,4 +1,5 @@
 import os
+import logging
 import uvicorn
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
@@ -20,6 +21,9 @@ RATE_LIMIT_WINDOW_SECONDS = 60.0
 CARDING_WINDOW_SECONDS = 300.0
 CARDING_PRICE_THRESHOLD_USD = 5.0
 CARDING_MAX_SMALL_QUOTES = 5
+
+logger = logging.getLogger("gateway_x")
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(
     title="Gateway X-OS API Gateway",
@@ -224,6 +228,10 @@ async def line_webhook(request: Request):
         text = event["message"]["text"].strip()
         line_user_id = event.get("source", {}).get("userId", "")
         reply_token = event.get("replyToken", "")
+
+        # ワーカー登録の仕組みがまだ無いため、動作確認用に受信したuserIdをログへ出力する。
+        # Renderのログでこの行を探せば、worker_line_user_idに設定すべき値が分かる。
+        logger.info(f"[LINE webhook] Received message from userId={line_user_id}: {text!r}")
 
         # メッセージ本文にexecution_idが含まれていればそれを優先し、
         # 無ければそのワーカーの直近のDISPATCHED案件を対象にする(簡易フォールバック)
