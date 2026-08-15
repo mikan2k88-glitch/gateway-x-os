@@ -59,17 +59,33 @@ class MasterOrchestrator:
         await self.concierge_service.notify_vetting_rejection(client_id, intent, reason)
 
     async def dispatch_to_worker(
-        self, client_id: str, quote: Dict[str, Any], worker_line_user_id: str,
+        self, client_id: str, quote: Dict[str, Any], worker_line_user_id: Optional[str] = None,
         payment_method_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Phase A(与信仮押さえ) → ワーカーへLINE通知 までを行い、DISPATCHED状態を返す。
         現場での実作業完了は非同期(LINE Webhook経由)で報告されるため、
         Capture(売上確定)はここでは行わない(complete_dispatch()で行う)。
+
+        worker_line_user_id を省略した場合、sales_repo に登録済みの全アクティブワーカーへ
+        一斉通知する(早い者勝ち方式)。complete_dispatch() はどのワーカーから「完了」報告が
+        来ても execution_id が一致すれば処理するため、複数人に送っても問題なく機能する。
         """
         intent = quote.get("intent", "")
         tier = quote.get("tier", "economy")
         execution_id = f"exec_{quote['quote_id']}"
+
+        # 宛先未指定なら登録済みワーカー全員をターゲットにする
+        target_ids = [worker_line_user_id] if worker_line_user_id else [
+            w["line_user_id"] for w in await self.sales_repo.get_active_workers()
+        ]
+        if not target_ids:
+            return {
+                "status": "NO_WORKER_AVAILABLE",
+                "quote_id": quote["quote_id"],
+                "reason": "登録済みのアクティブなワーカーがいません。worker_line_user_idを指定するか、"
+                          "ワーカーにLINEで「登録」と送ってもらってください。",
+            }
 
         auth_result = await self.stripe_service.authorize_payment(quote, payment_method_id)
         if not auth_result["success"]:
@@ -85,17 +101,24 @@ class MasterOrchestrator:
             "client_id": client_id, "quote_id": quote["quote_id"],
             "payment_intent_id": auth_result["payment_intent_id"], "tier": tier, "intent": intent,
             "price_usd": quote["price_usd"], "margin_percent": quote.get("margin_percent", 0),
-            "worker_line_user_id": worker_line_user_id,
+            "worker_line_user_id": worker_line_user_id,  # 一斉通知の場合はNoneのまま保存
         })
 
         notification_text = self.line_service.build_task_notification(execution_id, intent, tier)
-        line_result = await self.line_service.push_message(worker_line_user_id, notification_text)
+        push_results = []
+        for target_id in target_ids:
+            result = await self.line_service.push_message(target_id, notification_text)
+            push_results.append(result["success"])
         await self.db.log_event(
             "WORKER_NOTIFIED", intent,
-            f"execution_id={execution_id}, line_push_success={line_result['success']}", client_id
+            f"execution_id={execution_id}, targets={len(target_ids)}, "
+            f"success_count={sum(push_results)}", client_id
         )
 
-        return {"status": "DISPATCHED", "quote_id": quote["quote_id"], "execution_id": execution_id}
+        return {
+            "status": "DISPATCHED", "quote_id": quote["quote_id"], "execution_id": execution_id,
+            "notified_workers": len(target_ids),
+        }
 
     async def complete_dispatch(self, execution_id: str, field_status: str) -> Dict[str, Any]:
         """
