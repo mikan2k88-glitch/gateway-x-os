@@ -101,3 +101,18 @@ class ExecutionRepository:
                 row = cursor.fetchone()
                 return dict(row) if row else None
         return await asyncio.to_thread(_execute)
+
+    async def get_dispatch_by_payment_intent(self, payment_intent_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Stripeのチャージバック(dispute)Webhookはpayment_intent_idしか渡してこないため、
+        そこから対応するdispatchレコード(証拠提出に使う監査ログ)を逆引きする。
+        """
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT * FROM dispatches WHERE payment_intent_id = ?", (payment_intent_id,)
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        return await asyncio.to_thread(_execute)
