@@ -20,6 +20,8 @@ class SalesRepository:
     - quote_attempts: カーディング攻撃検知用。全ての見積発行試行(金額・時刻)を記録し、
       短時間に少額の見積を大量発行するパターン(盗難カードの有効性検証によく使われる手口)
       を検知するために使う
+    - workers: LINE経由でタスクを受ける現場ワーカーの登録簿。ワーカーがボットに「登録」と
+      送るとここに記録され、worker_line_user_id未指定でのタスク発行時に一斉通知の宛先となる
     """
 
     def __init__(self, db_path: str = "gateway_x.db"):
@@ -101,6 +103,16 @@ class SalesRepository:
                 client_id TEXT,
                 price_usd REAL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
+
+            # LINE経由の現場ワーカー登録簿
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS workers (
+                line_user_id TEXT PRIMARY KEY,
+                display_name TEXT,
+                active BOOLEAN DEFAULT 1,
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """)
 
@@ -305,3 +317,34 @@ class SalesRepository:
                 row = cursor.fetchone()
                 return row["cnt"] if row else 0
         return await asyncio.to_thread(_execute)
+
+    # ---------- workers / LINE経由のワーカー登録 ----------
+
+    async def register_worker(self, line_user_id: str, display_name: str = "") -> None:
+        """既に登録済みなら再登録扱い(display_name更新、activeをTrueに戻す)にする"""
+        def _execute():
+            with self._get_connection() as conn:
+                conn.execute("""
+                INSERT INTO workers (line_user_id, display_name, active)
+                VALUES (?, ?, 1)
+                ON CONFLICT(line_user_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    active = 1
+                """, (line_user_id, display_name))
+                conn.commit()
+        await asyncio.to_thread(_execute)
+
+    async def get_active_workers(self) -> List[Dict[str, Any]]:
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM workers WHERE active = 1")
+                return [dict(row) for row in cursor.fetchall()]
+        return await asyncio.to_thread(_execute)
+
+    async def deactivate_worker(self, line_user_id: str) -> None:
+        def _execute():
+            with self._get_connection() as conn:
+                conn.execute("UPDATE workers SET active = 0 WHERE line_user_id = ?", (line_user_id,))
+                conn.commit()
+        await asyncio.to_thread(_execute)
