@@ -24,8 +24,9 @@ class StripeService:
     各クライアントの実際の支払い方法IDを渡すこと)。
     """
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, webhook_secret: Optional[str] = None):
         stripe.api_key = api_key or os.environ.get("STRIPE_SECRET_KEY")
+        self.webhook_secret = webhook_secret or os.environ.get("STRIPE_WEBHOOK_SECRET")
 
     async def authorize_payment(
         self, quote: Dict[str, Any], payment_method_id: Optional[str] = None
@@ -110,3 +111,32 @@ class StripeService:
                 "status": "failed",
                 "reason": str(e.user_message or e),
             }
+
+    def verify_webhook(self, payload: bytes, sig_header: str):
+        """
+        Stripe Webhookの署名検証(なりすまし防止)。成功時はイベントオブジェクトを返す。
+        失敗時は stripe.error.SignatureVerificationError を送出する(呼び出し側でcatchする)。
+        """
+        return stripe.Webhook.construct_event(payload, sig_header, self.webhook_secret)
+
+    async def submit_dispute_evidence(self, dispute_id: str, evidence_text: str) -> Dict[str, Any]:
+        """
+        チャージバック(dispute)発生時に、蓄積済みの監査ログ(Auth ID/Capture ID/
+        LINE完了報告のタイムスタンプ等)を根拠として自動的に証拠を提出する。
+
+        「サービス提供後に未提供だと異議申立てされる」濫用への対策
+        (悪意あるクライアント対策5系統の5番)。evidence_textは呼び出し側
+        (master.py)が監査ログから組み立てて渡す。
+        """
+        def _execute():
+            return stripe.Dispute.modify(
+                dispute_id,
+                evidence={"uncategorized_text": evidence_text},
+                submit=True,
+            )
+
+        try:
+            dispute = await asyncio.to_thread(_execute)
+            return {"success": True, "dispute_id": dispute.id, "status": dispute.status}
+        except stripe.error.StripeError as e:
+            return {"success": False, "dispute_id": dispute_id, "status": "failed", "reason": str(e.user_message or e)}
