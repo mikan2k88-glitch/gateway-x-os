@@ -1,288 +1,271 @@
-import os
-import logging
-import uvicorn
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import Dict, Any
-from app.core.vetting import VettingEngine
+from typing import Dict, Any, Optional
+from app.db.repository import DatabaseRepository
 from app.core.pricing import PricingEngine
-from app.orchestrator.master import MasterOrchestrator
-from app.api.v1_feedback import router as feedback_router
-from app.sales.auth_gateway import create_auth_gateway_router
-from app.sales.concierge_service import create_concierge_router
-from app.core.rate_limiter import RateLimiter
-
-# レートリミッター設定: 1クライアントあたり60秒間に20リクエストまで(DoS対策)
-RATE_LIMIT_MAX_REQUESTS = 20
-RATE_LIMIT_WINDOW_SECONDS = 60.0
-
-# カーディング攻撃検知設定: 5分以内に$5未満の見積が5件以上ある場合は疑わしいパターンとみなす
-CARDING_WINDOW_SECONDS = 300.0
-CARDING_PRICE_THRESHOLD_USD = 5.0
-CARDING_MAX_SMALL_QUOTES = 5
-
-logger = logging.getLogger("gateway_x")
-logging.basicConfig(level=logging.INFO)
-
-app = FastAPI(
-    title="Gateway X-OS API Gateway",
-    version="3.2.0",
-    description="Physical Execution Gateway for Autonomous AI Agents"
-)
-vetting_engine = VettingEngine()
-pricing_engine = PricingEngine()
-orchestrator = MasterOrchestrator()
-rate_limiter = RateLimiter()
-app.include_router(feedback_router, prefix="/mcp/v1", tags=["Feedback"])
-# AuthGatewayの単体ルーター(/gateway/route)。orchestrator内部で使っているsales_repoと
-# 同じインスタンスを渡すことで、accountsテーブルの状態を共有する。
-app.include_router(create_auth_gateway_router(orchestrator.sales_repo))
-# ConciergeServiceの対話エンドポイント(/concierge/message)。自由記述の依頼から
-# intent/tier/estimated_cost_jpyを抽出し、不足があれば聞き返す質問を返す。
-# クライアントAIはここで情報が揃うまでやり取りし、揃った結果を
-# /mcp/v1/tools/call の arguments としてそのまま渡す想定。
-app.include_router(create_concierge_router(orchestrator.concierge_service))
+from app.core.vetting import VettingEngine
+from app.core.stripe_service import StripeService
+from app.core.physical_execution import PhysicalExecutionRouter
+from app.core.line_service import LineService
+from app.core.execution_repository import ExecutionRepository
+from app.sales.sales import SalesRepository
+from app.sales.auth_gateway import AuthGateway
+from app.sales.concierge_service import ConciergeService
 
 
-class MCPToolCallRequest(BaseModel):
-    name: str
-    arguments: Dict[str, Any]
+class MasterOrchestrator:
+    """
+    Gateway X-OS Master Orchestrator
+    Vetting → Pricing → 永続化 → 決済(Auth/Capture) → 現場実行(LINE連携) を統括する
+    """
+    def __init__(
+        self,
+        db_repository: Optional[DatabaseRepository] = None,
+        sales_repo: Optional[SalesRepository] = None,
+        stripe_service: Optional[StripeService] = None,
+        line_service: Optional[LineService] = None,
+        execution_repo: Optional[ExecutionRepository] = None,
+    ):
+        self.db = db_repository or DatabaseRepository()
+        self.pricing_engine = PricingEngine()
+        self.vetting_engine = VettingEngine()
+        self.sales_repo = sales_repo or SalesRepository()
+        self.auth_gateway = AuthGateway(self.sales_repo)
+        self.concierge_service = ConciergeService(self.sales_repo)
+        self.stripe_service = stripe_service or StripeService()
+        self.physical_router = PhysicalExecutionRouter()
+        self.line_service = line_service or LineService()
+        self.execution_repo = execution_repo or ExecutionRepository()
 
+    async def create_execution_event(
+        self,
+        client_id: str,
+        intent: str,
+        quote: Dict[str, Any],
+        vetting_result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Vetting通過後、見積を永続化しイベントIDを発行する(まだ決済は行わない)"""
+        quote_data = {**quote, "client_id": client_id, "intent": intent, "status": "QUOTED"}
+        await self.db.save_quote(quote_data)
+        await self.db.save_vetting_log({**vetting_result, "intent": intent, "client_id": client_id})
+        await self.db.log_event("QUOTED", intent, f"Quote generated: {quote['quote_id']}", client_id)
+        return {"event_id": quote["quote_id"]}
 
-class ExecuteRequest(BaseModel):
-    client_id: str
-    quote: Dict[str, Any]
-    payment_method_id: str = None
-    worker_line_user_id: str = None  # 指定があればLINE経由の非同期フローに切り替わる
+    async def log_security_alert(self, client_id: str, intent: str, reason: str) -> None:
+        """Vetting不合格時の拒絶ログ永続化"""
+        await self.db.save_vetting_log({
+            "passed": False, "reason": reason, "flagged_keywords": [],
+            "intent": intent, "client_id": client_id
+        })
+        await self.db.log_event("DECLINED", intent, reason, client_id)
+        await self.concierge_service.notify_vetting_rejection(client_id, intent, reason)
 
+    async def dispatch_to_worker(
+        self, client_id: str, quote: Dict[str, Any], worker_line_user_id: Optional[str] = None,
+        payment_method_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Phase A(与信仮押さえ) → ワーカーへLINE通知 までを行い、DISPATCHED状態を返す。
+        現場での実作業完了は非同期(LINE Webhook経由)で報告されるため、
+        Capture(売上確定)はここでは行わない(complete_dispatch()で行う)。
 
-@app.get("/")
-async def root():
-    return {
-        "status": "online",
-        "system": "Gateway X-OS",
-        "version": "3.2.0"
-    }
+        worker_line_user_id を省略した場合、sales_repo に登録済みの全アクティブワーカーへ
+        一斉通知する(早い者勝ち方式)。complete_dispatch() はどのワーカーから「完了」報告が
+        来ても execution_id が一致すれば処理するため、複数人に送っても問題なく機能する。
+        """
+        intent = quote.get("intent", "")
+        tier = quote.get("tier", "economy")
+        execution_id = f"exec_{quote['quote_id']}"
 
-
-@app.post("/mcp/v1/tools/call")
-async def handle_mcp_tool_call(
-    request: MCPToolCallRequest,
-    background_tasks: BackgroundTasks
-):
-    if request.name != "dispatch_physical_execution":
-        raise HTTPException(status_code=400, detail=f"Unknown tool name: {request.name}")
-
-    args = request.arguments
-    intent = args.get("intent", "")
-    tier = args.get("tier", "express")
-    estimated_cost_jpy = args.get("estimated_cost_jpy", 5000)
-    client_id = args.get("client_id", "anonymous_ai")
-
-    # レートリミッター: 海外AIクライアントの無限連打(DoS)を防止する一次防御
-    if not rate_limiter.check(client_id, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS):
-        return JSONResponse(
-            status_code=429,
-            content={
-                "status": "RATE_LIMITED",
-                "reason": f"Too many requests. Limit: {RATE_LIMIT_MAX_REQUESTS} per {int(RATE_LIMIT_WINDOW_SECONDS)}s.",
+        # 宛先未指定なら登録済みワーカー全員をターゲットにする
+        target_ids = [worker_line_user_id] if worker_line_user_id else [
+            w["line_user_id"] for w in await self.sales_repo.get_active_workers()
+        ]
+        if not target_ids:
+            return {
+                "status": "NO_WORKER_AVAILABLE",
+                "quote_id": quote["quote_id"],
+                "reason": "登録済みのアクティブなワーカーがいません。worker_line_user_idを指定するか、"
+                          "ワーカーにLINEで「登録」と送ってもらってください。",
             }
+
+        auth_result = await self.stripe_service.authorize_payment(quote, payment_method_id)
+        if not auth_result["success"]:
+            await self.db.log_event("PAYMENT_AUTH_FAILED", intent, auth_result["reason"], client_id)
+            await self.concierge_service.notify_payment_failure(client_id, quote["quote_id"], auth_result["reason"])
+            return {"status": "PAYMENT_FAILED", "quote_id": quote["quote_id"], "reason": auth_result["reason"]}
+
+        await self.db.log_event(
+            "PAYMENT_AUTHORIZED", intent, f"payment_intent={auth_result['payment_intent_id']}", client_id
         )
 
-    # AuthGatewayによるルーティング判定(routine/concierge)。
-    # ConciergeService未実装のため、現時点ではフローをブロックせず、
-    # レスポンスに含めて可視化するだけに留める(ConciergeService実装時に、
-    # route == "concierge" の場合はここで処理を分岐させる)。
-    route_info = await orchestrator.auth_gateway.decide_route(client_id, intent, tier)
-    if route_info["route"] == "concierge":
-        # 初回・非定型パターンの場合はConciergeServiceにリードとして記録させる。
-        # 現時点ではフローはブロックせず、通常のVetting/Pricingに進む
-        # (要件明確化ダイアログは未実装のため、ここでは記録と案内メッセージ生成のみ)
-        await orchestrator.concierge_service.handle_first_contact(client_id, intent, tier)
+        await self.execution_repo.create_dispatch(execution_id, {
+            "client_id": client_id, "quote_id": quote["quote_id"],
+            "payment_intent_id": auth_result["payment_intent_id"], "tier": tier, "intent": intent,
+            "price_usd": quote["price_usd"], "margin_percent": quote.get("margin_percent", 0),
+            "worker_line_user_id": worker_line_user_id,  # 一斉通知の場合はNoneのまま保存
+        })
 
-    # 0. Tier availability check (tactical は未実装のため拒否)
-    tier_check = VettingEngine.check_tier_availability(tier)
-    if not tier_check["available"]:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "REJECTED", "reason": tier_check["reason"]}
+        notification_text = self.line_service.build_task_notification(execution_id, intent, tier)
+        push_results = []
+        for target_id in target_ids:
+            result = await self.line_service.push_message(target_id, notification_text)
+            push_results.append(result["success"])
+        await self.db.log_event(
+            "WORKER_NOTIFIED", intent,
+            f"execution_id={execution_id}, targets={len(target_ids)}, "
+            f"success_count={sum(push_results)}", client_id
         )
 
-    # 1. Vetting
-    vetting_result = await vetting_engine.evaluate(intent=intent, client_id=client_id)
-    if not vetting_result["passed"]:
-        background_tasks.add_task(
-            orchestrator.log_security_alert, client_id, intent, vetting_result["reason"]
-        )
-        return JSONResponse(
-            status_code=403,
-            content={
-                "status": "DECLINED",
-                "reason": vetting_result["reason"],
-                "vetting_assessment": vetting_result
+        return {
+            "status": "DISPATCHED", "quote_id": quote["quote_id"], "execution_id": execution_id,
+            "notified_workers": len(target_ids),
+        }
+
+    async def complete_dispatch(self, execution_id: str, field_status: str) -> Dict[str, Any]:
+        """
+        LINE Webhook経由でワーカーから完了/失敗報告を受けた際に呼ぶ。
+        field_status: 'completed' | 'failed'
+        completedならCapture(売上確定)、failedなら与信解放(Cancel)を行う。
+        """
+        dispatch = await self.execution_repo.get_dispatch(execution_id)
+        if dispatch is None:
+            return {"status": "NOT_FOUND", "execution_id": execution_id}
+        if dispatch["status"] != "DISPATCHED":
+            return {"status": "ALREADY_PROCESSED", "execution_id": execution_id, "current_status": dispatch["status"]}
+
+        client_id = dispatch["client_id"]
+        intent = dispatch["intent"]
+
+        if field_status == "completed":
+            capture_result = await self.stripe_service.capture_payment(dispatch["payment_intent_id"])
+            if not capture_result["success"]:
+                await self.db.log_event("PAYMENT_CAPTURE_FAILED", intent, capture_result["reason"], client_id)
+                await self.concierge_service.notify_payment_failure(client_id, dispatch["quote_id"], capture_result["reason"])
+                await self.execution_repo.update_status(execution_id, "CAPTURE_FAILED")
+                return {"status": "CAPTURE_FAILED", "execution_id": execution_id, "reason": capture_result["reason"]}
+
+            await self.db.log_event(
+                "CAPTURED", intent, f"payment_intent={dispatch['payment_intent_id']}", client_id
+            )
+            await self.auth_gateway.record_order_completion(client_id, intent, dispatch["tier"])
+            await self.execution_repo.update_status(execution_id, "COMPLETED")
+            return {
+                "status": "COMPLETED", "execution_id": execution_id,
+                "revenue_captured_usd": dispatch["price_usd"],
+                "net_profit_usd": round(dispatch["price_usd"] * dispatch["margin_percent"] / 100, 2),
             }
-        )
-
-    # 2. Pricing
-    quote = pricing_engine.calculate_quote(
-        estimated_cost_jpy=estimated_cost_jpy,
-        tier=tier
-    )
-
-    # 2.5 カーディング攻撃検知: 少額見積の大量発行パターンをチェック
-    # (盗難カードの有効性を「与信が通るか」だけで検証する手口への対策)
-    await orchestrator.sales_repo.log_quote_attempt(client_id, quote["price_usd"])
-    small_quote_count = await orchestrator.sales_repo.count_recent_small_quotes(
-        client_id, CARDING_WINDOW_SECONDS, CARDING_PRICE_THRESHOLD_USD
-    )
-    if small_quote_count >= CARDING_MAX_SMALL_QUOTES:
-        reason = (
-            f"Suspicious pattern: {small_quote_count} quotes under "
-            f"${CARDING_PRICE_THRESHOLD_USD} within {int(CARDING_WINDOW_SECONDS)}s "
-            f"(possible carding attempt)."
-        )
-        background_tasks.add_task(orchestrator.log_security_alert, client_id, intent, reason)
-        return JSONResponse(
-            status_code=403,
-            content={"status": "FLAGGED_FOR_REVIEW", "reason": reason}
-        )
-
-    # 3. Master Orchestrator（永続化。この中でAuthGatewayの承認カウントも加算される）
-    dispatch_event = await orchestrator.create_execution_event(
-        client_id=client_id,
-        intent=intent,
-        quote=quote,
-        vetting_result=vetting_result
-    )
-
-    return {
-        "status": "QUOTED",
-        "quote_id": quote["quote_id"],
-        "tier": quote["tier"],
-        "price_usd": quote["price_usd"],
-        "estimated_cost_jpy": quote["estimated_cost_jpy"],
-        "margin_percent": quote["margin_percent"],
-        "currency": "USD",
-        "vetting_assessment": vetting_result,
-        "orchestration_event_id": dispatch_event["event_id"],
-        "routing": route_info["route"],  # 'routine' | 'concierge'(現時点では表示のみ)
-    }
-
-
-@app.post("/mcp/v1/tools/execute")
-async def handle_execute(request: ExecuteRequest):
-    """
-    /mcp/v1/tools/call が返した見積(quote)を受け取り、決済(Auth)を行う。
-
-    worker_line_user_id が指定されている場合: そのワーカー1人にLINE通知(個別指定)。
-    worker_line_user_id が無いが登録済みワーカーがいる場合: 登録済み全員に一斉通知(早い者勝ち)。
-    どちらの場合も status: "DISPATCHED" を返し、Captureは後でLINE Webhook経由で非同期に行われる。
-    クライアントAIは返ってきた execution_id で GET /mcp/v1/tools/execute/{execution_id}
-    をポーリングして進捗を確認できる。
-
-    worker_line_user_id が無く、登録済みワーカーも1人もいない場合: レガシーの同期実行パス
-    (execute_physical_task、プレ検収は固定で合格扱い)にフォールバックする。
-    """
-    if request.worker_line_user_id:
-        result = await orchestrator.dispatch_to_worker(
-            client_id=request.client_id,
-            quote=request.quote,
-            worker_line_user_id=request.worker_line_user_id,
-            payment_method_id=request.payment_method_id,
-        )
-    elif await orchestrator.sales_repo.get_active_workers():
-        result = await orchestrator.dispatch_to_worker(
-            client_id=request.client_id,
-            quote=request.quote,
-            worker_line_user_id=None,
-            payment_method_id=request.payment_method_id,
-        )
-    else:
-        result = await orchestrator.execute_physical_task(
-            client_id=request.client_id,
-            quote=request.quote,
-            payment_method_id=request.payment_method_id,
-        )
-    return result
-
-
-@app.get("/mcp/v1/tools/execute/{execution_id}")
-async def get_execution_status(execution_id: str):
-    """クライアントAIがDISPATCHED後の進捗をポーリングするためのエンドポイント"""
-    dispatch = await orchestrator.execution_repo.get_dispatch(execution_id)
-    if dispatch is None:
-        raise HTTPException(status_code=404, detail="execution_id not found")
-    return dispatch
-
-
-@app.post("/line/webhook")
-async def line_webhook(request: Request):
-    """
-    LINE Messaging APIからのWebhook。ワーカーが「完了 exec_xxx」/「失敗 exec_xxx」
-    と返信した際にここへ届く。署名を検証したうえで、対応する派遣(dispatch)を
-    完了/失敗として処理する。
-    """
-    body = await request.body()
-    signature = request.headers.get("X-Line-Signature", "")
-    if not orchestrator.line_service.verify_signature(body, signature):
-        raise HTTPException(status_code=403, detail="Invalid signature")
-
-    payload = await request.json()
-    results = []
-    for event in payload.get("events", []):
-        if event.get("type") != "message" or event.get("message", {}).get("type") != "text":
-            continue
-
-        text = event["message"]["text"].strip()
-        line_user_id = event.get("source", {}).get("userId", "")
-        reply_token = event.get("replyToken", "")
-
-        # ワーカー登録の仕組みがまだ無いため、動作確認用に受信したuserIdをログへ出力する。
-        # Renderのログでこの行を探せば、worker_line_user_idに設定すべき値が分かる。
-        logger.info(f"[LINE webhook] Received message from userId={line_user_id}: {text!r}")
-
-        # ワーカー登録: 「登録」というメッセージで自身のline_user_idをworkersテーブルに記録する
-        if text in ("登録", "ワーカー登録"):
-            await orchestrator.sales_repo.register_worker(line_user_id, display_name="")
-            reply_text = "ワーカー登録が完了しました。今後、新規タスクが発生した際に通知します。"
-            if reply_token:
-                await orchestrator.line_service.reply_message(reply_token, reply_text)
-            results.append({"status": "WORKER_REGISTERED", "line_user_id": line_user_id})
-            continue
-
-        # メッセージ本文にexecution_idが含まれていればそれを優先し、
-        # 無ければそのワーカーの直近のDISPATCHED案件を対象にする(簡易フォールバック)
-        execution_id = None
-        for token in text.split():
-            if token.startswith("exec_"):
-                execution_id = token
-                break
-        if execution_id is None:
-            latest = await orchestrator.execution_repo.find_latest_dispatched_by_worker(line_user_id)
-            execution_id = latest["execution_id"] if latest else None
-
-        if execution_id is None:
-            continue
-
-        if "完了" in text:
-            result = await orchestrator.complete_dispatch(execution_id, "completed")
-            reply_text = "報告ありがとうございます。完了処理をしました。" if result["status"] == "COMPLETED" \
-                else f"処理でエラーが発生しました({result['status']})。運営にご連絡ください。"
-        elif "失敗" in text or "できません" in text:
-            result = await orchestrator.complete_dispatch(execution_id, "failed")
-            reply_text = "承知しました。与信を解放しました。ご対応ありがとうございました。"
         else:
-            result = None
-            reply_text = "「完了」または「失敗」に管理番号を添えて返信してください。"
+            cancel_result = await self.stripe_service.cancel_payment(
+                dispatch["payment_intent_id"], reason="worker_reported_failure"
+            )
+            await self.db.log_event("PAYMENT_CANCELED", intent, "worker reported failure", client_id)
+            await self.execution_repo.update_status(execution_id, "FAILED")
+            return {"status": "FAILED", "execution_id": execution_id, "payment_canceled": cancel_result["success"]}
 
-        if reply_token:
-            await orchestrator.line_service.reply_message(reply_token, reply_text)
-        results.append(result)
+    async def handle_chargeback(self, dispute_id: str, payment_intent_id: str) -> Dict[str, Any]:
+        """
+        Stripeからのdispute(チャージバック)Webhook受信時に呼ぶ。
+        dispute_idは証拠提出先の特定に、payment_intent_idはこちら側の監査ログ
+        (dispatchレコード)の逆引きに使う。
 
-    return {"status": "ok", "processed": len(results)}
+        「サービスは実際に完了報告(LINE)を受けて提供済みである」ことを示す証拠を
+        自動的に組み立ててStripeへ提出する。completed以外(FAILED等)のdispatchや、
+        そもそも見つからない場合は、正当な異議申立ての可能性があるため自動証拠提出は
+        行わず、要人力確認としてログのみ残す。
+        """
+        dispatch = await self.execution_repo.get_dispatch_by_payment_intent(payment_intent_id)
+        if dispatch is None:
+            await self.db.log_event(
+                "CHARGEBACK_UNRESOLVED", "", f"payment_intent={payment_intent_id}: dispatch not found", "unknown"
+            )
+            return {"status": "NO_RECORD", "payment_intent_id": payment_intent_id}
 
+        await self.db.log_event(
+            "CHARGEBACK_RECEIVED", dispatch["intent"], f"execution_id={dispatch['execution_id']}",
+            dispatch["client_id"]
+        )
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+        if dispatch["status"] != "COMPLETED":
+            # 完了報告が無いままの注文へのチャージバックは、こちら側にも非がある可能性があるため
+            # 自動反論はせず、要人力レビューとして記録するに留める
+            await self.db.log_event(
+                "CHARGEBACK_NEEDS_MANUAL_REVIEW", dispatch["intent"],
+                f"execution_id={dispatch['execution_id']}, dispatch_status={dispatch['status']}",
+                dispatch["client_id"]
+            )
+            return {
+                "status": "NEEDS_MANUAL_REVIEW", "payment_intent_id": payment_intent_id,
+                "execution_id": dispatch["execution_id"], "dispatch_status": dispatch["status"],
+            }
+
+        # 完了報告(LINE経由)を受けて実際にCapture済みの注文 -> 自動で証拠を組み立てて提出
+        evidence_text = (
+            f"Gateway X-OS 業務実行記録\n"
+            f"管理番号(execution_id): {dispatch['execution_id']}\n"
+            f"依頼内容: {dispatch['intent']}\n"
+            f"サービス階級(tier): {dispatch['tier']}\n"
+            f"担当ワーカーLINEユーザーID: {dispatch['worker_line_user_id'] or '(一斉通知、応答者が担当)'}\n"
+            f"完了報告受信日時(UTC): {dispatch['updated_at']}\n"
+            f"決済確定(Capture)日時: 完了報告受信と同時に自動確定\n"
+            f"本注文はLINE Messaging API経由でワーカーから明示的な完了報告を受けた後、"
+            f"システムが自動的に決済を確定させたものです。"
+        )
+        result = await self.stripe_service.submit_dispute_evidence(dispute_id, evidence_text)
+        await self.db.log_event(
+            "CHARGEBACK_EVIDENCE_SUBMITTED", dispatch["intent"],
+            f"execution_id={dispatch['execution_id']}, success={result.get('success')}",
+            dispatch["client_id"]
+        )
+        return {
+            "status": "EVIDENCE_SUBMITTED", "payment_intent_id": payment_intent_id,
+            "execution_id": dispatch["execution_id"], "evidence_text": evidence_text,
+            "submission_result": result,
+        }
+
+    async def execute_physical_task(
+        self, client_id: str, quote: Dict[str, Any], payment_method_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        [レガシー/テスト用フォールバック] worker_line_user_idが無い場合の同期実行パス。
+        実ワーカーとのLINE連携が無い環境での動作確認用に残している。
+        本番でワーカーが登録されている場合は dispatch_to_worker() を使うこと。
+        """
+        intent = quote.get("intent", "")
+        tier = quote.get("tier", "economy")
+
+        auth_result = await self.stripe_service.authorize_payment(quote, payment_method_id)
+        if not auth_result["success"]:
+            await self.db.log_event("PAYMENT_AUTH_FAILED", intent, auth_result["reason"], client_id)
+            await self.concierge_service.notify_payment_failure(client_id, quote["quote_id"], auth_result["reason"])
+            return {"status": "PAYMENT_FAILED", "quote_id": quote["quote_id"], "reason": auth_result["reason"]}
+
+        await self.db.log_event(
+            "PAYMENT_AUTHORIZED", intent, f"payment_intent={auth_result['payment_intent_id']}", client_id
+        )
+        field_result = self.physical_router.route(tier, intent)
+
+        if field_result["field_status"] != "PRE_INSPECTED_PASSED":
+            cancel_result = await self.stripe_service.cancel_payment(
+                auth_result["payment_intent_id"], reason=field_result["field_status"]
+            )
+            await self.db.log_event("PAYMENT_CANCELED", intent, f"field_status={field_result['field_status']}", client_id)
+            return {
+                "status": "EXECUTION_FAILED", "quote_id": quote["quote_id"],
+                "reason": field_result["field_status"], "payment_canceled": cancel_result["success"],
+            }
+
+        capture_result = await self.stripe_service.capture_payment(auth_result["payment_intent_id"])
+        if not capture_result["success"]:
+            await self.db.log_event("PAYMENT_CAPTURE_FAILED", intent, capture_result["reason"], client_id)
+            await self.concierge_service.notify_payment_failure(client_id, quote["quote_id"], capture_result["reason"])
+            return {"status": "CAPTURE_FAILED", "quote_id": quote["quote_id"], "reason": capture_result["reason"]}
+
+        await self.db.log_event("CAPTURED", intent, f"payment_intent={auth_result['payment_intent_id']}", client_id)
+        await self.auth_gateway.record_order_completion(client_id, intent, tier)
+
+        return {
+            "status": "COMPLETED", "quote_id": quote["quote_id"],
+            "execution_id": f"exec_{quote['quote_id']}",
+            "assigned_to": field_result["assigned_to"],
+            "revenue_captured_usd": quote["price_usd"],
+            "net_profit_usd": round(quote["price_usd"] * quote.get("margin_percent", 0) / 100, 2),
+        }
