@@ -196,6 +196,18 @@ class SalesRepository:
                 return [dict(row) for row in cursor.fetchall()]
         return await asyncio.to_thread(_execute)
 
+    async def get_lead_by_client(self, client_id: str) -> Optional[Dict[str, Any]]:
+        """指定クライアントの直近のleadレコードを1件返す(無ければNone)。重複作成の防止用"""
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT * FROM leads WHERE client_id = ? ORDER BY updated_at DESC LIMIT 1", (client_id,)
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        return await asyncio.to_thread(_execute)
+
     # ---------- strategy_cycles / Planner <-> Executor ----------
 
     async def start_strategy_cycle(self, proposal: str) -> int:
