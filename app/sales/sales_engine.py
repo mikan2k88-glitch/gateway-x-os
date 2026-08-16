@@ -42,11 +42,23 @@ class SalesEngine:
 
         evaluation = await self.executor.evaluate_cycle(debate_result["cycle_id"], constraint_ctx)
 
+        feature_request = None
+        if evaluation["status"] == "approved":
+            # 承認された(=実際に実行される)戦略案についてのみ機能要望を検出する。
+            # 却下/保留案について機能要望を検討するのは無駄なコストなので行わない。
+            detection = await self.planner.detect_feature_request(debate_result["final_proposal"])
+            if detection["feature_needed"]:
+                await self.sales_repo.create_feature_request(
+                    debate_result["cycle_id"], detection["title"], detection["description"]
+                )
+                feature_request = detection
+
         return {
             "cycle_id": debate_result["cycle_id"],
             "stage": evaluation["status"],  # 'approved' | 'rejected'
             "debate": debate_result,
             "evaluation": evaluation,
+            "feature_request": feature_request,
         }
 
     async def report_capacity(
