@@ -12,6 +12,7 @@ from app.api.v1_feedback import router as feedback_router
 from app.sales.auth_gateway import create_auth_gateway_router
 from app.sales.concierge_service import create_concierge_router
 from app.sales.constraint_registry import ConstraintContext, ImplementationPhase, LegalRiskLevel
+from app.sales.quote_builder import QuoteBuilder
 from app.core.rate_limiter import RateLimiter
 
 # レートリミッター設定: 1クライアントあたり60秒間に20リクエストまで(DoS対策)
@@ -35,6 +36,7 @@ vetting_engine = VettingEngine()
 pricing_engine = PricingEngine()
 orchestrator = MasterOrchestrator()
 rate_limiter = RateLimiter()
+quote_builder = QuoteBuilder(pricing_engine, orchestrator.sales_repo)
 app.include_router(feedback_router, prefix="/mcp/v1", tags=["Feedback"])
 # AuthGatewayの単体ルーター(/gateway/route)。orchestrator内部で使っているsales_repoと
 # 同じインスタンスを渡すことで、accountsテーブルの状態を共有する。
@@ -136,10 +138,9 @@ async def handle_mcp_tool_call(
             }
         )
 
-    # 2. Pricing
-    quote = pricing_engine.calculate_quote(
-        estimated_cost_jpy=estimated_cost_jpy,
-        tier=tier
+    # 2. Pricing (QuoteBuilder経由: PricingEngineの計算にトライアル割引を上乗せ)
+    quote = await quote_builder.build_quote(
+        client_id=client_id, estimated_cost_jpy=estimated_cost_jpy, tier=tier
     )
 
     # 2.5 カーディング攻撃検知: 少額見積の大量発行パターンをチェック
@@ -176,6 +177,8 @@ async def handle_mcp_tool_call(
         "estimated_cost_jpy": quote["estimated_cost_jpy"],
         "margin_percent": quote["margin_percent"],
         "currency": "USD",
+        "trial_discount_applied": quote.get("trial_discount_applied", False),
+        "original_price_usd": quote.get("original_price_usd"),
         "vetting_assessment": vetting_result,
         "orchestration_event_id": dispatch_event["event_id"],
         "routing": route_info["route"],  # 'routine' | 'concierge'(現時点では表示のみ)
