@@ -9,6 +9,11 @@ from app.core.execution_repository import ExecutionRepository
 from app.sales.sales import SalesRepository
 from app.sales.auth_gateway import AuthGateway
 from app.sales.concierge_service import ConciergeService
+from app.sales.strategy_planner import StrategyPlanner
+from app.sales.strategy_executor import StrategyExecutor
+from app.sales.sales_engine import SalesEngine
+from app.sales.outreach_service import OutreachService
+from app.sales.constraint_registry import ConstraintContext
 
 
 class MasterOrchestrator:
@@ -34,6 +39,32 @@ class MasterOrchestrator:
         self.physical_router = PhysicalExecutionRouter()
         self.line_service = line_service or LineService()
         self.execution_repo = execution_repo or ExecutionRepository()
+        # SalesEngine(討論→評価)とOutreachService(承認された戦略の実行)。
+        # ここまで実装のみで呼び出し元が無かったため、strategy_cycleとして配線する。
+        self.strategy_planner = StrategyPlanner(self.sales_repo)
+        self.strategy_executor = StrategyExecutor(self.sales_repo)
+        self.sales_engine = SalesEngine(self.strategy_planner, self.strategy_executor, self.sales_repo)
+        self.outreach_service = OutreachService(self.sales_repo)
+
+    async def run_strategy_cycle(
+        self, topic: str, context: str, constraint_ctx: ConstraintContext, target_client_ids: Optional[list] = None
+    ) -> Dict[str, Any]:
+        """
+        討論(StrategyPlanner) → 評価(StrategyExecutor) → 承認されれば実行(OutreachService)
+        までを1回でまとめて行う。target_client_ids未指定の場合は、sales_repoのleadsテーブルから
+        stage='lead'のクライアントを自動的に対象にする(新規リードへのトライアル案内が主目的のため)。
+        """
+        result = await self.sales_engine.run_strategy_cycle(topic, context, constraint_ctx)
+
+        if result["stage"] != "approved":
+            return {**result, "outreach": None}
+
+        if target_client_ids is None:
+            leads = await self.sales_repo.get_leads_by_stage("lead")
+            target_client_ids = [lead["client_id"] for lead in leads]
+
+        outreach_result = await self.outreach_service.run_from_strategy_result(result, target_client_ids)
+        return {**result, "outreach": outreach_result}
 
     async def create_execution_event(
         self,
