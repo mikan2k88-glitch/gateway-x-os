@@ -22,6 +22,8 @@ class SalesRepository:
       を検知するために使う
     - workers: LINE経由でタスクを受ける現場ワーカーの登録簿。ワーカーがボットに「登録」と
       送るとここに記録され、worker_line_user_id未指定でのタスク発行時に一斉通知の宛先となる
+    - feature_requests: StrategyPlannerの討論中に「既存機能では対応できず、新機能が必要」と
+      判断された場合に記録する。営業活動の副産物として開発ロードマップのヒントを蓄積する
     """
 
     def __init__(self, db_path: str = "gateway_x.db"):
@@ -113,6 +115,18 @@ class SalesRepository:
                 display_name TEXT,
                 active BOOLEAN DEFAULT 1,
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
+
+            # 営業エンジンの討論から生まれた機能要望の記録簿
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS feature_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id INTEGER,
+                title TEXT,
+                description TEXT,
+                status TEXT DEFAULT 'open',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """)
 
@@ -360,3 +374,25 @@ class SalesRepository:
                 conn.execute("UPDATE workers SET active = 0 WHERE line_user_id = ?", (line_user_id,))
                 conn.commit()
         await asyncio.to_thread(_execute)
+
+    # ---------- feature_requests / 営業エンジンからの機能要望 ----------
+
+    async def create_feature_request(self, cycle_id: int, title: str, description: str) -> None:
+        def _execute():
+            with self._get_connection() as conn:
+                conn.execute("""
+                INSERT INTO feature_requests (cycle_id, title, description, status)
+                VALUES (?, ?, ?, 'open')
+                """, (cycle_id, title, description))
+                conn.commit()
+        await asyncio.to_thread(_execute)
+
+    async def get_open_feature_requests(self) -> List[Dict[str, Any]]:
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT * FROM feature_requests WHERE status = 'open' ORDER BY created_at DESC"
+                )
+                return [dict(row) for row in cursor.fetchall()]
+        return await asyncio.to_thread(_execute)
