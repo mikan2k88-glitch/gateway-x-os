@@ -38,7 +38,7 @@ class OutreachService:
         if self._outreach_paused:
             return {"client_id": client_id, "action": "skipped", "reason": "outreach paused"}
 
-        existing = await self.sales_repo.get_account(client_id)
+        existing = await self.sales_repo.get_lead_by_client(client_id)
         if existing is None:
             await self.sales_repo.create_lead(client_id, source=source, notes=notes)
         await self.sales_repo.update_lead_stage(client_id, "trial")
