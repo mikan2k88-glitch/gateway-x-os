@@ -1,7 +1,7 @@
 from typing import Any, Dict, Optional
 
-from sales import SalesRepository
-from constraint_registry import ConstraintRegistry, ConstraintContext
+from .sales import SalesRepository
+from .constraint_registry import ConstraintRegistry, ConstraintContext
 
 
 class StrategyExecutor:
