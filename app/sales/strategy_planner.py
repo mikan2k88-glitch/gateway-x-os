@@ -1,3 +1,4 @@
+import json
 import os
 from typing import Any, Dict, Optional
 
@@ -130,4 +131,43 @@ class StrategyPlanner:
             "round_count": round_count,
             "final_proposal": revision,
             "last_critique": critique,
+        }
+
+    # ---------- 機能要望検出 ----------
+
+    _FEATURE_DETECTION_INSTRUCTION = (
+        "あなたはGateway X-OSの開発ロードマップ担当です。以下の営業戦略案を読み、"
+        "これを実行するために、今のGateway Xにまだ無い新しいシステム機能が必要かどうかを"
+        "判定してください。既存の一般的な営業活動(トライアル案内、フォローアップ等)だけで"
+        "実行できる場合は不要と判定してください。"
+        "必ず以下のJSON形式のみで出力してください(説明文やコードブロック記号は付けない):\n"
+        '{"feature_needed": true/false, "title": "機能名を一言で(不要ならnull)", '
+        '"description": "その機能が何をすべきかの説明(不要ならnull)"}'
+    )
+
+    async def detect_feature_request(self, proposal: str) -> Dict[str, Any]:
+        """
+        討論で承認された戦略案が、既存のGateway Xの機能だけで実行可能かを判定し、
+        新機能が必要な場合はタイトルと説明を返す。営業活動の副産物として
+        開発ロードマップのヒントを蓄積するために使う(SalesEngine側から呼ばれる)。
+        """
+        response = await self.client.aio.models.generate_content(
+            model=self.model,
+            contents=f"戦略案:\n{proposal}",
+            config=types.GenerateContentConfig(
+                system_instruction=self._FEATURE_DETECTION_INSTRUCTION,
+                response_mime_type="application/json",
+            ),
+        )
+        raw_text = (response.text or "").strip()
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError:
+            # 判定不能な場合は「不要」扱いにする(機能要望は誤検知より見逃しの方が実害が小さい)
+            parsed = {"feature_needed": False, "title": None, "description": None}
+
+        return {
+            "feature_needed": bool(parsed.get("feature_needed", False)),
+            "title": parsed.get("title"),
+            "description": parsed.get("description"),
         }
