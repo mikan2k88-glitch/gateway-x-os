@@ -48,7 +48,7 @@ class SemanticSafetyReviewer:
         '"reasoning": "判定理由を1文で"}'
     )
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-3.6-flash"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-3.7-flash"):
         api_key = api_key or os.environ.get("GEMINI_API_KEY")
         self.client = genai.Client(api_key=api_key) if api_key else genai.Client()
         self.model = model
