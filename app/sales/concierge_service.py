@@ -22,9 +22,9 @@ class ConciergeService:
     4. Stripe決済失敗時の通知受け皿(同上)
 
     要件明確化はGemini(google-genai)に、JSON形式での構造化出力を指示して行う。
-    会話履歴はこのクラス自身では永続化しない(呼び出し側が history を毎回渡す
-    ステートレス設計。leads.notesへの会話ログ保存はスキーマ拡張が必要なため今回は
-    見送り、既知の制約として明記しておく)。
+    会話履歴はsales.pyのconcierge_messagesテーブルに永続化する。呼び出し側が
+    historyを明示的に渡した場合はそちらを優先するが(テスト・別経路からの呼び出し向け)、
+    通常のAPI経由(historyを渡さない)ではDBから自動的に読み込む。
     """
 
     def __init__(
@@ -80,10 +80,18 @@ class ConciergeService:
         自由記述の依頼メッセージを解析し、
         - 情報が揃っていれば needs_clarification=False + 抽出済みintent/tier/estimated_cost_jpy
         - 不足していれば needs_clarification=True + 聞き返す質問
-        を返す。history は [{"role": "user"|"concierge", "text": "..."}] 形式の過去のやり取り
-        (呼び出し側が保持・毎回渡すステートレス設計)。
+        を返す。
+
+        history を明示的に渡した場合はそれを使う(テスト等での上書き用)。
+        渡さなかった場合は sales_repo.get_concierge_history() でDBから自動的に読み込み、
+        今回のやり取り(userのmessageとconciergeの応答)を最後にDBへ追記する。
+        これにより、同一client_idからの複数回の対話で自動的に文脈が引き継がれる。
         """
-        history = history or []
+        history_explicit = history is not None
+        if not history_explicit:
+            past = await self.sales_repo.get_concierge_history(client_id)
+            history = [{"role": h["role"], "text": h["message"]} for h in past]
+
         conversation = "\n".join(f"{h['role']}: {h['text']}" for h in history)
         prompt = (
             (f"これまでのやり取り:\n{conversation}\n\n" if conversation else "")
@@ -119,7 +127,7 @@ class ConciergeService:
                     "estimated_cost_jpy": None,
                 }
 
-        return {
+        result = {
             "client_id": client_id,
             "needs_clarification": bool(parsed.get("needs_clarification", True)),
             "question": parsed.get("question"),
@@ -127,6 +135,15 @@ class ConciergeService:
             "tier": parsed.get("tier"),
             "estimated_cost_jpy": parsed.get("estimated_cost_jpy"),
         }
+
+        if not history_explicit:
+            # DB自動読み込みモードの場合のみ、今回のやり取りを永続化する
+            # (historyを明示的に渡すテスト等では、呼び出し側が状態管理の責任を持つため保存しない)
+            await self.sales_repo.append_concierge_message(client_id, "user", message)
+            concierge_reply = result["question"] or "情報を確認しました。ありがとうございます。"
+            await self.sales_repo.append_concierge_message(client_id, "concierge", concierge_reply)
+
+        return result
 
     async def notify_vetting_rejection(self, client_id: str, intent: str, reason: str) -> Dict[str, Any]:
         """VettingEngine却下時の通知受け皿。却下理由をクライアントへ返す文面を組み立てる"""
