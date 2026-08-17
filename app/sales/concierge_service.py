@@ -22,16 +22,16 @@ class ConciergeService:
     4. Stripe決済失敗時の通知受け皿(同上)
 
     要件明確化はGemini(google-genai)に、JSON形式での構造化出力を指示して行う。
-    会話履歴はsales.pyのconcierge_messagesテーブルに永続化する。呼び出し側が
-    historyを明示的に渡した場合はそちらを優先するが(テスト・別経路からの呼び出し向け)、
-    通常のAPI経由(historyを渡さない)ではDBから自動的に読み込む。
+    会話履歴はsales_repoのconcierge_messagesテーブルに永続化する。呼び出し側が
+    historyを明示的に渡した場合はそちらを優先する(後方互換のステートレス利用も可能)が、
+    渡さない場合はDBに保存された過去のやり取りを自動的に読み込んで文脈を引き継ぐ。
     """
 
     def __init__(
         self,
         sales_repo: SalesRepository,
         api_key: Optional[str] = None,
-        model: str = "gemini-3.6-flash",
+        model: str = "gemini-3.7-flash",
     ):
         self.sales_repo = sales_repo
         api_key = api_key or os.environ.get("GEMINI_API_KEY")
@@ -82,17 +82,18 @@ class ConciergeService:
         - 不足していれば needs_clarification=True + 聞き返す質問
         を返す。
 
-        history を明示的に渡した場合はそれを使う(テスト等での上書き用)。
-        渡さなかった場合は sales_repo.get_concierge_history() でDBから自動的に読み込み、
-        今回のやり取り(userのmessageとconciergeの応答)を最後にDBへ追記する。
-        これにより、同一client_idからの複数回の対話で自動的に文脈が引き継がれる。
+        history を明示的に渡した場合はそれを使う(後方互換)。渡さない場合は
+        concierge_messagesテーブルから直近の会話履歴を自動的に読み込む。
+        どちらの経路でも、今回のやり取り(ユーザーメッセージ+コンシェルジュの応答)は
+        呼び出し後にDBへ追記され、次回以降の対話で引き継がれる。
         """
-        history_explicit = history is not None
-        if not history_explicit:
-            past = await self.sales_repo.get_concierge_history(client_id)
-            history = [{"role": h["role"], "text": h["message"]} for h in past]
+        if history is not None:
+            turns = [{"role": h["role"], "text": h["text"]} for h in history]
+        else:
+            stored = await self.sales_repo.get_concierge_history(client_id)
+            turns = [{"role": h["role"], "text": h["message"]} for h in stored]
 
-        conversation = "\n".join(f"{h['role']}: {h['text']}" for h in history)
+        conversation = "\n".join(f"{h['role']}: {h['text']}" for h in turns)
         prompt = (
             (f"これまでのやり取り:\n{conversation}\n\n" if conversation else "")
             + f"クライアントからの最新メッセージ:\n{message}"
@@ -136,12 +137,14 @@ class ConciergeService:
             "estimated_cost_jpy": parsed.get("estimated_cost_jpy"),
         }
 
-        if not history_explicit:
-            # DB自動読み込みモードの場合のみ、今回のやり取りを永続化する
-            # (historyを明示的に渡すテスト等では、呼び出し側が状態管理の責任を持つため保存しない)
-            await self.sales_repo.append_concierge_message(client_id, "user", message)
-            concierge_reply = result["question"] or "情報を確認しました。ありがとうございます。"
-            await self.sales_repo.append_concierge_message(client_id, "concierge", concierge_reply)
+        # 会話履歴を永続化(次回以降の対話で文脈を引き継ぐため)
+        await self.sales_repo.append_concierge_message(client_id, "user", message)
+        concierge_reply = (
+            result["question"] if result["needs_clarification"]
+            else f"情報が揃いました: intent={result['intent']}, tier={result['tier']}, "
+                 f"estimated_cost_jpy={result['estimated_cost_jpy']}"
+        )
+        await self.sales_repo.append_concierge_message(client_id, "concierge", concierge_reply or "")
 
         return result
 
