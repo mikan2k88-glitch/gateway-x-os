@@ -24,6 +24,8 @@ class SalesRepository:
       送るとここに記録され、worker_line_user_id未指定でのタスク発行時に一斉通知の宛先となる
     - feature_requests: StrategyPlannerの討論中に「既存機能では対応できず、新機能が必要」と
       判断された場合に記録する。営業活動の副産物として開発ロードマップのヒントを蓄積する
+    - concierge_messages: ConciergeServiceの会話履歴。クライアントごとのやり取りを永続化し、
+      次回以降の対話で過去の文脈を引き継げるようにする
     """
 
     def __init__(self, db_path: str = "gateway_x.db"):
@@ -126,6 +128,17 @@ class SalesRepository:
                 title TEXT,
                 description TEXT,
                 status TEXT DEFAULT 'open',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
+
+            # ConciergeServiceの会話履歴
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS concierge_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id TEXT,
+                role TEXT,
+                message TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """)
@@ -394,5 +407,31 @@ class SalesRepository:
                 cursor.execute(
                     "SELECT * FROM feature_requests WHERE status = 'open' ORDER BY created_at DESC"
                 )
+                return [dict(row) for row in cursor.fetchall()]
+        return await asyncio.to_thread(_execute)
+
+    # ---------- concierge_messages / 会話履歴 ----------
+
+    async def append_concierge_message(self, client_id: str, role: str, message: str) -> None:
+        """role は 'user' | 'concierge' を想定"""
+        def _execute():
+            with self._get_connection() as conn:
+                conn.execute("""
+                INSERT INTO concierge_messages (client_id, role, message) VALUES (?, ?, ?)
+                """, (client_id, role, message))
+                conn.commit()
+        await asyncio.to_thread(_execute)
+
+    async def get_concierge_history(self, client_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """直近の会話履歴を古い順で返す(promptに時系列で組み込みやすくするため)"""
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                SELECT * FROM (
+                    SELECT * FROM concierge_messages WHERE client_id = ?
+                    ORDER BY id DESC LIMIT ?
+                ) ORDER BY id ASC
+                """, (client_id, limit))
                 return [dict(row) for row in cursor.fetchall()]
         return await asyncio.to_thread(_execute)
