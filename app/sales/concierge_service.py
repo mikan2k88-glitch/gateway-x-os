@@ -8,6 +8,7 @@ from google import genai
 from google.genai import types
 
 from .sales import SalesRepository
+from app.core.gemini_retry import generate_content_with_retry
 
 
 class ConciergeService:
@@ -99,7 +100,8 @@ class ConciergeService:
             + f"クライアントからの最新メッセージ:\n{message}"
         )
 
-        response = await self.client.aio.models.generate_content(
+        response = await generate_content_with_retry(
+            self.client,
             model=self.model,
             contents=prompt,
             config=types.GenerateContentConfig(
