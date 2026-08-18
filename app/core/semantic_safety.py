@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 from google import genai
 from google.genai import types
 
+from .gemini_retry import generate_content_with_retry
+
 
 class SemanticSafetyReviewer:
     """
@@ -56,7 +58,8 @@ class SemanticSafetyReviewer:
     async def review(self, intent: str) -> Dict[str, Any]:
         prompt = f"【審査対象の依頼文】\n{intent}"
 
-        response = await self.client.aio.models.generate_content(
+        response = await generate_content_with_retry(
+            self.client,
             model=self.model,
             contents=prompt,
             config=types.GenerateContentConfig(
