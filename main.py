@@ -14,6 +14,7 @@ from app.sales.concierge_service import create_concierge_router
 from app.sales.constraint_registry import ConstraintContext, ImplementationPhase, LegalRiskLevel
 from app.sales.quote_builder import QuoteBuilder
 from app.core.rate_limiter import RateLimiter
+from google.genai import errors as genai_errors
 
 # レートリミッター設定: 1クライアントあたり60秒間に20リクエストまで(DoS対策)
 RATE_LIMIT_MAX_REQUESTS = 20
@@ -32,6 +33,27 @@ app = FastAPI(
     version="3.2.0",
     description="Physical Execution Gateway for Autonomous AI Agents"
 )
+
+
+@app.exception_handler(genai_errors.ServerError)
+async def gemini_server_error_handler(request, exc: genai_errors.ServerError):
+    """
+    gemini_retry.pyがプライマリ+全フォールバックモデルを使い切っても解決しなかった場合、
+    ここで拾って綺麗な503を返す(素の500 Internal Server Errorでクラッシュさせない)。
+    Gemini APIが一時的に(場合によっては複数モデルにまたがって)不安定な時間帯に、
+    アプリ全体が落ちたように見えることを防ぐための最終防波堤。
+    """
+    logger.error(f"[Gemini] All models exhausted, returning 503 to client: {exc}")
+    return JSONResponse(
+        status_code=503,
+        content={
+            "status": "GEMINI_UNAVAILABLE",
+            "reason": "Geminiが一時的に混雑しており、複数モデルへのフォールバックも失敗しました。"
+                      "しばらく待ってから再度お試しください。",
+        },
+    )
+
+
 vetting_engine = VettingEngine()
 pricing_engine = PricingEngine()
 orchestrator = MasterOrchestrator()
