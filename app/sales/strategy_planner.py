@@ -6,6 +6,7 @@ from google import genai
 from google.genai import types
 
 from .sales import SalesRepository
+from app.core.gemini_retry import generate_content_with_retry
 
 
 class StrategyPlanner:
@@ -43,7 +44,8 @@ class StrategyPlanner:
     # ---------- Gemini呼び出し(人格ごとにsystem_instructionを変える) ----------
 
     async def _call_gemini(self, prompt: str, system_instruction: str) -> str:
-        response = await self.client.aio.models.generate_content(
+        response = await generate_content_with_retry(
+            self.client,
             model=self.model,
             contents=prompt,
             config=types.GenerateContentConfig(system_instruction=system_instruction),
@@ -151,7 +153,8 @@ class StrategyPlanner:
         新機能が必要な場合はタイトルと説明を返す。営業活動の副産物として
         開発ロードマップのヒントを蓄積するために使う(SalesEngine側から呼ばれる)。
         """
-        response = await self.client.aio.models.generate_content(
+        response = await generate_content_with_retry(
+            self.client,
             model=self.model,
             contents=f"戦略案:\n{proposal}",
             config=types.GenerateContentConfig(
