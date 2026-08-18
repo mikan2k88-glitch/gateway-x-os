@@ -11,7 +11,7 @@ async def generate_content_with_retry(
     client: Any,
     max_attempts: int = 3,
     initial_delay: float = 2.0,
-    fallback_model: str = "gemini-3.6-flash",
+    fallback_models: tuple = ("gemini-3.6-flash", "gemini-2.5-flash"),
     **kwargs,
 ):
     """
@@ -19,10 +19,15 @@ async def generate_content_with_retry(
     に対して指数バックオフでリトライするラッパー。
 
     google-genai自体も内部でtenacityを使ってリトライしているが、それでも失敗して
-    ServerErrorが上がってくることがある(新モデルのリリース直後は特に高負荷になりやすい)。
-    そのため、こちらのリトライを使い切っても失敗した場合は、最後の手段として
-    fallback_model(デフォルトは実績のある gemini-3.6-flash)で1回だけ試す。
-    フォールバックも失敗したら、その例外を送出する。
+    ServerErrorが上がってくることがある。さらに、プライマリモデルだけでなく
+    フォールバック先のモデルまで同時に混雑することもある(2026-08-18に実際に観測: 
+    gemini-3.7-flashだけでなくgemini-3.6-flashも503になるケースがあった。これは
+    単一モデルの問題ではなくGemini API全体が広く不安定になっている時間帯だった)。
+    そのため、fallback_modelsは単一モデルではなくタプル(複数候補)を受け取り、
+    プライマリのリトライを使い切った後、上から順に1回ずつ試す。
+
+    全モデルが失敗した場合は最後の例外を送出する。呼び出し元(main.py)が
+    genai_errors.ServerErrorをキャッチしてクライアントには503を返す設計になっている。
 
     ServerError以外の例外(認証エラー等、リトライしても解決しないもの)はそのまま送出する。
 
@@ -50,9 +55,11 @@ async def generate_content_with_retry(
             await asyncio.sleep(delay)
             delay *= 2
 
-    # プライマリモデルのリトライを使い切った場合、フォールバックモデルで最後に1回だけ試す
-    if fallback_model and fallback_model != kwargs.get("model"):
-        logger.warning(f"[Gemini retry] Falling back to {fallback_model} after primary model failure")
+    # プライマリモデルのリトライを使い切った場合、フォールバック候補を上から順に1回ずつ試す
+    for fallback_model in fallback_models:
+        if fallback_model == kwargs.get("model"):
+            continue
+        logger.warning(f"[Gemini retry] Falling back to {fallback_model} after previous failure")
         fallback_kwargs = {**kwargs, "model": fallback_model}
         try:
             return await client.aio.models.generate_content(**fallback_kwargs)
