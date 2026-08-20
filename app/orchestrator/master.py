@@ -47,14 +47,23 @@ class MasterOrchestrator:
         self.outreach_service = OutreachService(self.sales_repo)
 
     async def run_strategy_cycle(
-        self, topic: str, context: str, constraint_ctx: ConstraintContext, target_client_ids: Optional[list] = None
+        self, topic: str, context: str, constraint_ctx: ConstraintContext,
+        target_client_ids: Optional[list] = None, max_rounds: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         討論(StrategyPlanner) → 評価(StrategyExecutor) → 承認されれば実行(OutreachService)
         までを1回でまとめて行う。target_client_ids未指定の場合は、sales_repoのleadsテーブルから
         stage='lead'のクライアントを自動的に対象にする(新規リードへのトライアル案内が主目的のため)。
+        max_roundsを指定すると、その回のみ討論のラウンド数上限を一時的に上書きする
+        (複雑な議題で3ラウンドでは収束しないケースが実際に確認されたため追加)。
         """
-        result = await self.sales_engine.run_strategy_cycle(topic, context, constraint_ctx)
+        original_max_rounds = self.strategy_planner.max_rounds
+        if max_rounds is not None:
+            self.strategy_planner.max_rounds = max_rounds
+        try:
+            result = await self.sales_engine.run_strategy_cycle(topic, context, constraint_ctx)
+        finally:
+            self.strategy_planner.max_rounds = original_max_rounds
 
         if result["stage"] != "approved":
             return {**result, "outreach": None}
