@@ -40,16 +40,30 @@ async def gemini_server_error_handler(request, exc: genai_errors.ServerError):
     """
     gemini_retry.pyがプライマリ+全フォールバックモデルを使い切っても解決しなかった場合、
     ここで拾って綺麗な503を返す(素の500 Internal Server Errorでクラッシュさせない)。
-    Gemini APIが一時的に(場合によっては複数モデルにまたがって)不安定な時間帯に、
-    アプリ全体が落ちたように見えることを防ぐための最終防波堤。
     """
-    logger.error(f"[Gemini] All models exhausted, returning 503 to client: {exc}")
+    logger.error(f"[Gemini] All models exhausted (ServerError), returning 503 to client: {exc}")
     return JSONResponse(
         status_code=503,
         content={
             "status": "GEMINI_UNAVAILABLE",
             "reason": "Geminiが一時的に混雑しており、複数モデルへのフォールバックも失敗しました。"
                       "しばらく待ってから再度お試しください。",
+        },
+    )
+
+
+@app.exception_handler(genai_errors.ClientError)
+async def gemini_client_error_handler(request, exc: genai_errors.ClientError):
+    """
+    429 RESOURCE_EXHAUSTED(クォータ超過)がフォールバックも含めて全て失敗した場合。
+    有料プランに切り替えていれば通常は発生しないはずだが、念のため拾っておく。
+    """
+    logger.error(f"[Gemini] Quota/client error on all models, returning 429 to client: {exc}")
+    return JSONResponse(
+        status_code=429,
+        content={
+            "status": "GEMINI_QUOTA_EXCEEDED",
+            "reason": "Geminiのクォータ超過、または不正なリクエストです。プランと請求設定を確認してください。",
         },
     )
 
