@@ -100,6 +100,7 @@ class StrategyCycleRequest(BaseModel):
     topic: str
     context: str = ""
     target_client_ids: list = None
+    max_rounds: int = 3
     # ConstraintContextの主要フィールドを平坦化して受け取る(呼び出し側の負担を減らすため)
     implementation_phase: str = "b2b_procurement"
     legal_risk: str = "none"
@@ -377,6 +378,7 @@ async def run_strategy_cycle(request: StrategyCycleRequest):
         context=request.context,
         constraint_ctx=constraint_ctx,
         target_client_ids=request.target_client_ids,
+        max_rounds=request.max_rounds,
     )
     return result
 
