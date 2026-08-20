@@ -19,11 +19,10 @@ class StrategyPlanner:
     討論を打ち切る。max_rounds に達しても収束しない場合は、本来StrategyExecutorが行う
     保留判定を暫定的にここで代行する(Executor実装後はそちらに移す)。
 
-    当初は「ChatGPTとClaude Code、異なるモデル同士の討論」という設計だったが、既にGemini
-    APIキー(有料プラン)を保有しており、requirements.txtにも google-genai が既に含まれて
-    いるため、新規にOpenAI/Anthropicのサインアップ・キー管理コストをかけずGemini単体での
-    2人格自己討論に変更した。トレードオフとして、批判役が別モデルほど厳しくならない
-    (同じモデルの癖を引きずる)リスクがあるため、プロンプトで人格をはっきり分けている。
+    Gemini APIが有料プランで安価に使えることが判明したため、Groq/OpenRouterへの
+    移行は行わず、Geminiを継続利用する(2026-08-18)。無料枠のクォータ制約(1日20
+    リクエスト/モデル)に対しては、gemini_retry.pyの多段フォールバック
+    (gemini-3.7-flash -> gemini-3.6-flash -> gemini-2.5-flash)で耐性を持たせている。
     """
 
     def __init__(
@@ -34,8 +33,6 @@ class StrategyPlanner:
         max_rounds: int = 3,
     ):
         self.sales_repo = sales_repo
-        # google-genai は GEMINI_API_KEY / GOOGLE_API_KEY 環境変数を自動で拾うが、
-        # 明示的に渡された場合はそちらを優先する
         api_key = api_key or os.environ.get("GEMINI_API_KEY")
         self.client = genai.Client(api_key=api_key) if api_key else genai.Client()
         self.model = model
