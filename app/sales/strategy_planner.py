@@ -29,7 +29,7 @@ class StrategyPlanner:
         self,
         sales_repo: SalesRepository,
         api_key: Optional[str] = None,
-        model: str = "gemini-3.7-flash",
+        model: str = "gemini-3.6-flash",
         max_rounds: int = 3,
     ):
         self.sales_repo = sales_repo
