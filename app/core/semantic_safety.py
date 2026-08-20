@@ -27,6 +27,9 @@ class SemanticSafetyReviewer:
     という指示階層をsystem_instructionで明示している。これにより、
     ConciergeService.clarify_intent側が細工された依頼文に騙されてtier等を
     誤抽出したとしても、ここが最終防波堤として機能する。
+
+    Gemini APIが有料プランで安価に使えることが判明したため、Groq/OpenRouterへの
+    移行は行わずGeminiを継続利用する(2026-08-18)。
     """
 
     _SYSTEM_INSTRUCTION = (
@@ -78,7 +81,6 @@ class SemanticSafetyReviewer:
             try:
                 parsed = json.loads(cleaned)
             except json.JSONDecodeError:
-                # パース不能な場合は安全側に倒し、危険判定として人間のレビューに回す
                 parsed = {
                     "is_safe": False,
                     "risk_categories": ["semantic_review_parse_error"],
