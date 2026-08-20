@@ -11,7 +11,7 @@ async def generate_content_with_retry(
     client: Any,
     max_attempts: int = 3,
     initial_delay: float = 2.0,
-    fallback_models: tuple = ("gemini-3.6-flash", "gemini-2.5-flash"),
+    fallback_models: tuple = ("gemini-3.6-flash", "gemini-3.5-flash"),
     **kwargs,
 ):
     """
@@ -26,8 +26,19 @@ async def generate_content_with_retry(
     そのため、fallback_modelsは単一モデルではなくタプル(複数候補)を受け取り、
     プライマリのリトライを使い切った後、上から順に1回ずつ試す。
 
+    注意: gemini-2.5-flashは公式の廃止予定日(2026-10-16)より前倒しで既に
+    利用不可(404/500相当)を返すケースが実際に確認されたため、フォールバック候補
+    から除外している(2026-08-18)。廃止予定が近いモデルはフォールバック先として
+    選ばない方が安全。
+
     全モデルが失敗した場合は最後の例外を送出する。呼び出し元(main.py)が
-    genai_errors.ServerErrorをキャッチしてクライアントには503を返す設計になっている。
+    genai_errors.ServerError/ClientErrorをキャッチしてクライアントには503/429を返す設計。
+
+    ClientError(429 RESOURCE_EXHAUSTED)はクォータ超過を意味し、同一モデルへの
+    即時リトライでは解決しないため、リトライループには入らず即座にフォールバックへ進む。
+    クォータはモデルごとに別枠で管理されているため、フォールバック先は別モデルとして
+    独立したクォータを持つ(2026-08-18に無料枠のgemini-3.7-flashが1日20リクエストの
+    上限に達したことで発覚。根本解決には有料プランへの切り替えが必要)。
 
     ServerError以外の例外(認証エラー等、リトライしても解決しないもの)はそのまま送出する。
 
@@ -36,6 +47,7 @@ async def generate_content_with_retry(
     """
     delay = initial_delay
     last_exc: Exception = None
+    primary_model = kwargs.get("model")
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -44,8 +56,7 @@ async def generate_content_with_retry(
             last_exc = e
             if attempt == max_attempts:
                 logger.warning(
-                    f"[Gemini retry] All {max_attempts} attempts on "
-                    f"{kwargs.get('model')} failed: {e}"
+                    f"[Gemini retry] All {max_attempts} attempts on {primary_model} failed: {e}"
                 )
                 break
             logger.info(
@@ -54,16 +65,26 @@ async def generate_content_with_retry(
             )
             await asyncio.sleep(delay)
             delay *= 2
+        except genai_errors.ClientError as e:
+            # 429 RESOURCE_EXHAUSTED(クォータ超過)は、同じモデルへの即時リトライでは
+            # 解決しない(日次クォータのリセット待ちになるため)。ここで粘らず、
+            # 即座にフォールバック候補(別モデル=別クォータ)へ切り替える。
+            last_exc = e
+            logger.warning(
+                f"[Gemini retry] {primary_model} returned ClientError (likely quota exceeded): "
+                f"{e}. Skipping same-model retries, moving to fallback."
+            )
+            break
 
     # プライマリモデルのリトライを使い切った場合、フォールバック候補を上から順に1回ずつ試す
     for fallback_model in fallback_models:
-        if fallback_model == kwargs.get("model"):
+        if fallback_model == primary_model:
             continue
         logger.warning(f"[Gemini retry] Falling back to {fallback_model} after previous failure")
         fallback_kwargs = {**kwargs, "model": fallback_model}
         try:
             return await client.aio.models.generate_content(**fallback_kwargs)
-        except genai_errors.ServerError as e:
+        except (genai_errors.ServerError, genai_errors.ClientError) as e:
             logger.warning(f"[Gemini retry] Fallback model {fallback_model} also failed: {e}")
             last_exc = e
 
