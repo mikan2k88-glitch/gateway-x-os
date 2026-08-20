@@ -23,6 +23,8 @@ class ConciergeService:
     4. Stripe決済失敗時の通知受け皿(同上)
 
     要件明確化はGemini(google-genai)に、JSON形式での構造化出力を指示して行う。
+    Gemini APIが有料プランで安価に使えることが判明したため、Groq/OpenRouterへの
+    移行は行わずGeminiを継続利用する(2026-08-18)。
     会話履歴はsales_repoのconcierge_messagesテーブルに永続化する。呼び出し側が
     historyを明示的に渡した場合はそちらを優先する(後方互換のステートレス利用も可能)が、
     渡さない場合はDBに保存された過去のやり取りを自動的に読み込んで文脈を引き継ぐ。
@@ -42,12 +44,6 @@ class ConciergeService:
     async def handle_first_contact(
         self, client_id: str, intent: str, tier: str, source: str = "auto_routed"
     ) -> Dict[str, Any]:
-        """
-        AuthGatewayでroute == 'concierge'と判定された際に呼ぶ。
-        既存リードが無ければ新規作成し、案内メッセージを返す。
-        現時点ではMasterOrchestratorへのフローはブロックしない
-        (ConciergeServiceは並行して初回接触を記録するだけ)。
-        """
         existing = await self.sales_repo.get_account(client_id)
         if existing is None:
             await self.sales_repo.create_lead(
@@ -58,8 +54,6 @@ class ConciergeService:
             "内容を確認のうえ通常フローで見積を発行します。"
         )
         return {"client_id": client_id, "handled": True, "message": message}
-
-    # ---------- 要件明確化ダイアログ ----------
 
     _CLARIFY_SYSTEM_INSTRUCTION = (
         "あなたはB2B調達エージェント向けサービス「Gateway X」のコンシェルジュです。"
@@ -77,24 +71,12 @@ class ConciergeService:
     async def clarify_intent(
         self, client_id: str, message: str, history: Optional[List[Dict[str, str]]] = None
     ) -> Dict[str, Any]:
-        """
-        自由記述の依頼メッセージを解析し、
-        - 情報が揃っていれば needs_clarification=False + 抽出済みintent/tier/estimated_cost_jpy
-        - 不足していれば needs_clarification=True + 聞き返す質問
-        を返す。
+        history_explicit = history is not None
+        if not history_explicit:
+            past = await self.sales_repo.get_concierge_history(client_id)
+            history = [{"role": h["role"], "text": h["message"]} for h in past]
 
-        history を明示的に渡した場合はそれを使う(後方互換)。渡さない場合は
-        concierge_messagesテーブルから直近の会話履歴を自動的に読み込む。
-        どちらの経路でも、今回のやり取り(ユーザーメッセージ+コンシェルジュの応答)は
-        呼び出し後にDBへ追記され、次回以降の対話で引き継がれる。
-        """
-        if history is not None:
-            turns = [{"role": h["role"], "text": h["text"]} for h in history]
-        else:
-            stored = await self.sales_repo.get_concierge_history(client_id)
-            turns = [{"role": h["role"], "text": h["message"]} for h in stored]
-
-        conversation = "\n".join(f"{h['role']}: {h['text']}" for h in turns)
+        conversation = "\n".join(f"{h['role']}: {h['text']}" for h in history)
         prompt = (
             (f"これまでのやり取り:\n{conversation}\n\n" if conversation else "")
             + f"クライアントからの最新メッセージ:\n{message}"
@@ -114,14 +96,12 @@ class ConciergeService:
         try:
             parsed = json.loads(raw_text)
         except json.JSONDecodeError:
-            # Geminiがまれに前後にテキストを付けてしまった場合の保険的なフォールバック
             cleaned = raw_text.strip("`\n ")
             if cleaned.startswith("json"):
                 cleaned = cleaned[4:].strip()
             try:
                 parsed = json.loads(cleaned)
             except json.JSONDecodeError:
-                # 完全にパース不能な場合は安全側に倒し、聞き返す質問扱いにする
                 parsed = {
                     "needs_clarification": True,
                     "question": "恐れ入りますが、ご依頼内容をもう少し具体的に教えていただけますか？",
@@ -139,19 +119,14 @@ class ConciergeService:
             "estimated_cost_jpy": parsed.get("estimated_cost_jpy"),
         }
 
-        # 会話履歴を永続化(次回以降の対話で文脈を引き継ぐため)
-        await self.sales_repo.append_concierge_message(client_id, "user", message)
-        concierge_reply = (
-            result["question"] if result["needs_clarification"]
-            else f"情報が揃いました: intent={result['intent']}, tier={result['tier']}, "
-                 f"estimated_cost_jpy={result['estimated_cost_jpy']}"
-        )
-        await self.sales_repo.append_concierge_message(client_id, "concierge", concierge_reply or "")
+        if not history_explicit:
+            await self.sales_repo.append_concierge_message(client_id, "user", message)
+            concierge_reply = result["question"] or "情報を確認しました。ありがとうございます。"
+            await self.sales_repo.append_concierge_message(client_id, "concierge", concierge_reply)
 
         return result
 
     async def notify_vetting_rejection(self, client_id: str, intent: str, reason: str) -> Dict[str, Any]:
-        """VettingEngine却下時の通知受け皿。却下理由をクライアントへ返す文面を組み立てる"""
         message = (
             f"申し訳ございませんが、今回のご依頼(intent: {intent})はお受けできませんでした。"
             f"理由: {reason}"
@@ -159,15 +134,12 @@ class ConciergeService:
         return {"client_id": client_id, "handled": True, "message": message}
 
     async def notify_payment_failure(self, client_id: str, quote_id: str, reason: str) -> Dict[str, Any]:
-        """Stripe決済失敗(リトライ後)の通知受け皿"""
         message = (
             f"お見積り(quote_id: {quote_id})について決済処理に失敗しました。理由: {reason}。"
             "お手数ですが決済方法をご確認のうえ再度お試しください。"
         )
         return {"client_id": client_id, "handled": True, "message": message}
 
-
-# ---------- FastAPI ルーター ----------
 
 class ConciergeMessageRequest(BaseModel):
     client_id: str
