@@ -4,7 +4,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 from app.core.vetting import VettingEngine
 from app.core.pricing import PricingEngine
 from app.orchestrator.master import MasterOrchestrator
@@ -73,14 +73,13 @@ pricing_engine = PricingEngine()
 orchestrator = MasterOrchestrator()
 rate_limiter = RateLimiter()
 quote_builder = QuoteBuilder(pricing_engine, orchestrator.sales_repo)
+
 app.include_router(feedback_router, prefix="/mcp/v1", tags=["Feedback"])
 # AuthGatewayの単体ルーター(/gateway/route)。orchestrator内部で使っているsales_repoと
 # 同じインスタンスを渡すことで、accountsテーブルの状態を共有する。
 app.include_router(create_auth_gateway_router(orchestrator.sales_repo))
 # ConciergeServiceの対話エンドポイント(/concierge/message)。自由記述の依頼から
 # intent/tier/estimated_cost_jpyを抽出し、不足があれば聞き返す質問を返す。
-# クライアントAIはここで情報が揃うまでやり取りし、揃った結果を
-# /mcp/v1/tools/call の arguments としてそのまま渡す想定。
 app.include_router(create_concierge_router(orchestrator.concierge_service))
 
 
@@ -93,7 +92,7 @@ class ExecuteRequest(BaseModel):
     client_id: str
     quote: Dict[str, Any]
     payment_method_id: str = None
-    worker_line_user_id: str = None
+    worker_line_user_id: str = None  # 指定があればLINE経由の非同期フローに切り替わる
 
 
 class StrategyCycleRequest(BaseModel):
@@ -101,11 +100,12 @@ class StrategyCycleRequest(BaseModel):
     context: str = ""
     target_client_ids: list = None
     max_rounds: int = 3
+    skip_feature_detection: bool = False
     # ConstraintContextの主要フィールドを平坦化して受け取る(呼び出し側の負担を減らすため)
     implementation_phase: str = "b2b_procurement"
     legal_risk: str = "none"
     requires_external_api: bool = False
-    external_api_available: bool = True  # 指定があればLINE経由の非同期フローに切り替わる
+    external_api_available: bool = True
 
 
 @app.get("/")
@@ -142,14 +142,10 @@ async def handle_mcp_tool_call(
         )
 
     # AuthGatewayによるルーティング判定(routine/concierge)。
-    # ConciergeService未実装のため、現時点ではフローをブロックせず、
-    # レスポンスに含めて可視化するだけに留める(ConciergeService実装時に、
-    # route == "concierge" の場合はここで処理を分岐させる)。
+    # ConciergeService未実装当初の名残でフローはブロックしない設計のまま。
     route_info = await orchestrator.auth_gateway.decide_route(client_id, intent, tier)
     if route_info["route"] == "concierge":
         # 初回・非定型パターンの場合はConciergeServiceにリードとして記録させる。
-        # 現時点ではフローはブロックせず、通常のVetting/Pricingに進む
-        # (要件明確化ダイアログは未実装のため、ここでは記録と案内メッセージ生成のみ)
         await orchestrator.concierge_service.handle_first_contact(client_id, intent, tier)
 
     # 0. Tier availability check (tactical は未実装のため拒否)
@@ -160,7 +156,7 @@ async def handle_mcp_tool_call(
             content={"status": "REJECTED", "reason": tier_check["reason"]}
         )
 
-    # 1. Vetting
+    # 1. Vetting(キーワードフィルタ + セマンティック審査)
     vetting_result = await vetting_engine.evaluate(intent=intent, client_id=client_id)
     if not vetting_result["passed"]:
         background_tasks.add_task(
@@ -181,7 +177,6 @@ async def handle_mcp_tool_call(
     )
 
     # 2.5 カーディング攻撃検知: 少額見積の大量発行パターンをチェック
-    # (盗難カードの有効性を「与信が通るか」だけで検証する手口への対策)
     await orchestrator.sales_repo.log_quote_attempt(client_id, quote["price_usd"])
     small_quote_count = await orchestrator.sales_repo.count_recent_small_quotes(
         client_id, CARDING_WINDOW_SECONDS, CARDING_PRICE_THRESHOLD_USD
@@ -198,7 +193,7 @@ async def handle_mcp_tool_call(
             content={"status": "FLAGGED_FOR_REVIEW", "reason": reason}
         )
 
-    # 3. Master Orchestrator（永続化。この中でAuthGatewayの承認カウントも加算される）
+    # 3. Master Orchestrator（永続化。決済はここではまだ行わない）
     dispatch_event = await orchestrator.create_execution_event(
         client_id=client_id,
         intent=intent,
@@ -218,7 +213,7 @@ async def handle_mcp_tool_call(
         "original_price_usd": quote.get("original_price_usd"),
         "vetting_assessment": vetting_result,
         "orchestration_event_id": dispatch_event["event_id"],
-        "routing": route_info["route"],  # 'routine' | 'concierge'(現時点では表示のみ)
+        "routing": route_info["route"],
     }
 
 
@@ -261,7 +256,7 @@ async def handle_execute(request: ExecuteRequest):
 
 @app.get("/mcp/v1/tools/execute/{execution_id}")
 async def get_execution_status(execution_id: str):
-    """クライアントAIがDISPATCHED後の進捗をポーリングするためのエンドポイント"""
+    """クライアントAIが進捗をポーリングして確認するためのエンドポイント"""
     dispatch = await orchestrator.execution_repo.get_dispatch(execution_id)
     if dispatch is None:
         raise HTTPException(status_code=404, detail="execution_id not found")
@@ -271,9 +266,9 @@ async def get_execution_status(execution_id: str):
 @app.post("/line/webhook")
 async def line_webhook(request: Request):
     """
-    LINE Messaging APIからのWebhook。ワーカーが「完了 exec_xxx」/「失敗 exec_xxx」
-    と返信した際にここへ届く。署名を検証したうえで、対応する派遣(dispatch)を
-    完了/失敗として処理する。
+    LINE Messaging APIからのWebhookイベントを受け取る。
+    - 「登録」というメッセージ: workersテーブルへの自動登録
+    - 「完了 exec_xxx」「失敗 exec_xxx」というメッセージ: complete_dispatch()を呼ぶ
     """
     body = await request.body()
     signature = request.headers.get("X-Line-Signature", "")
@@ -282,6 +277,7 @@ async def line_webhook(request: Request):
 
     payload = await request.json()
     results = []
+
     for event in payload.get("events", []):
         if event.get("type") != "message" or event.get("message", {}).get("type") != "text":
             continue
@@ -291,7 +287,6 @@ async def line_webhook(request: Request):
         reply_token = event.get("replyToken", "")
 
         # ワーカー登録の仕組みがまだ無いため、動作確認用に受信したuserIdをログへ出力する。
-        # Renderのログでこの行を探せば、worker_line_user_idに設定すべき値が分かる。
         logger.info(f"[LINE webhook] Received message from userId={line_user_id}: {text!r}")
 
         # ワーカー登録: 「登録」というメッセージで自身のline_user_idをworkersテーブルに記録する
@@ -306,28 +301,30 @@ async def line_webhook(request: Request):
         # メッセージ本文にexecution_idが含まれていればそれを優先し、
         # 無ければそのワーカーの直近のDISPATCHED案件を対象にする(簡易フォールバック)
         execution_id = None
-        for token in text.split():
-            if token.startswith("exec_"):
-                execution_id = token
-                break
-        if execution_id is None:
-            latest = await orchestrator.execution_repo.find_latest_dispatched_by_worker(line_user_id)
-            execution_id = latest["execution_id"] if latest else None
+        field_status = None
+        if text.startswith("完了"):
+            field_status = "completed"
+            parts = text.split()
+            if len(parts) > 1:
+                execution_id = parts[1]
+        elif text.startswith("失敗"):
+            field_status = "failed"
+            parts = text.split()
+            if len(parts) > 1:
+                execution_id = parts[1]
 
-        if execution_id is None:
+        if field_status is None:
             continue
 
-        if "完了" in text:
-            result = await orchestrator.complete_dispatch(execution_id, "completed")
-            reply_text = "報告ありがとうございます。完了処理をしました。" if result["status"] == "COMPLETED" \
-                else f"処理でエラーが発生しました({result['status']})。運営にご連絡ください。"
-        elif "失敗" in text or "できません" in text:
-            result = await orchestrator.complete_dispatch(execution_id, "failed")
-            reply_text = "承知しました。与信を解放しました。ご対応ありがとうございました。"
-        else:
-            result = None
-            reply_text = "「完了」または「失敗」に管理番号を添えて返信してください。"
+        if execution_id is None:
+            dispatch = await orchestrator.execution_repo.find_latest_dispatched_by_worker(line_user_id)
+            if dispatch is None:
+                continue
+            execution_id = dispatch["execution_id"]
 
+        result = await orchestrator.complete_dispatch(execution_id, field_status)
+        reply_text = "報告ありがとうございます。完了処理をしました。" if result["status"] == "COMPLETED" \
+            else f"報告を受け付けました(状態: {result['status']})。"
         if reply_token:
             await orchestrator.line_service.reply_message(reply_token, reply_text)
         results.append(result)
@@ -366,6 +363,10 @@ async def run_strategy_cycle(request: StrategyCycleRequest):
     現時点では自動スケジューリングの仕組みが無いため、手動 or 外部Cron(Render Cron Job等)
     からの呼び出しを想定している。target_client_ids未指定時は、leadsテーブルの
     stage='lead'なクライアント全員がトライアル案内の対象になる。
+
+    max_rounds を指定すると、その回のみ討論のラウンド数上限を一時的に上書きできる。
+    skip_feature_detection=true を指定すると、承認時の機能要望検出(LLM呼び出し1回分)を
+    省略でき、応答速度を優先できる(2026-08-20の応答遅延調査を受けて追加)。
     """
     constraint_ctx = ConstraintContext(
         implementation_phase=ImplementationPhase(request.implementation_phase),
@@ -379,6 +380,7 @@ async def run_strategy_cycle(request: StrategyCycleRequest):
         constraint_ctx=constraint_ctx,
         target_client_ids=request.target_client_ids,
         max_rounds=request.max_rounds,
+        skip_feature_detection=request.skip_feature_detection,
     )
     return result
 
