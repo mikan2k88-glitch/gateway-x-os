@@ -21,7 +21,8 @@ class SalesEngine:
         self.sales_repo = sales_repo
 
     async def run_strategy_cycle(
-        self, topic: str, context: str, constraint_ctx: ConstraintContext
+        self, topic: str, context: str, constraint_ctx: ConstraintContext,
+        skip_feature_detection: bool = False,
     ) -> Dict[str, Any]:
         """
         討論 -> (収束したら)制約評価 まで一気通貫で実行する。
@@ -29,6 +30,10 @@ class SalesEngine:
         - 討論が3ラウンドで未収束の場合: StrategyPlanner側で既に 'pending' 判定済みのため、
           ここでは制約評価をスキップしてそのまま返す(まだ承認/却下を判断できる段階ではない)
         - 討論が収束した場合: StrategyExecutor.evaluate_cycle() を呼び、承認/却下を確定する
+
+        skip_feature_detection=True にすると、承認時のdetect_feature_request呼び出し
+        (LLM呼び出し1回分)を省略できる。応答速度を優先したい場合に使う
+        (2026-08-20の応答遅延調査を受けて追加)。
         """
         debate_result = await self.planner.run_debate_cycle(topic, context)
 
@@ -43,7 +48,7 @@ class SalesEngine:
         evaluation = await self.executor.evaluate_cycle(debate_result["cycle_id"], constraint_ctx)
 
         feature_request = None
-        if evaluation["status"] == "approved":
+        if evaluation["status"] == "approved" and not skip_feature_detection:
             # 承認された(=実際に実行される)戦略案についてのみ機能要望を検出する。
             # 却下/保留案について機能要望を検討するのは無駄なコストなので行わない。
             detection = await self.planner.detect_feature_request(debate_result["final_proposal"])
