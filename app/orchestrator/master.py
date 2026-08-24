@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from app.db.repository import DatabaseRepository
 from app.core.pricing import PricingEngine
 from app.core.vetting import VettingEngine
@@ -19,7 +19,7 @@ from app.sales.constraint_registry import ConstraintContext
 class MasterOrchestrator:
     """
     Gateway X-OS Master Orchestrator
-    Vetting → Pricing → 永続化 → 決済(Auth/Capture) → 現場実行(LINE連携) を統括する
+    Vetting → Pricing → 永続化 → 決済(Auth/Capture) → 現場実行(LINE連携) → 営業エンジン を統括する
     """
     def __init__(
         self,
@@ -32,6 +32,9 @@ class MasterOrchestrator:
         self.db = db_repository or DatabaseRepository()
         self.pricing_engine = PricingEngine()
         self.vetting_engine = VettingEngine()
+        # AuthGatewayが参照するaccountsテーブルはsales_repo側にある。
+        # db_repository(operations用)とは別のSQLiteファイル接続だが、
+        # 同じgateway_x.dbを指す想定なのでdb_pathを揃えて渡すこと。
         self.sales_repo = sales_repo or SalesRepository()
         self.auth_gateway = AuthGateway(self.sales_repo)
         self.concierge_service = ConciergeService(self.sales_repo)
@@ -39,41 +42,12 @@ class MasterOrchestrator:
         self.physical_router = PhysicalExecutionRouter()
         self.line_service = line_service or LineService()
         self.execution_repo = execution_repo or ExecutionRepository()
-        # SalesEngine(討論→評価)とOutreachService(承認された戦略の実行)。
-        # ここまで実装のみで呼び出し元が無かったため、strategy_cycleとして配線する。
+
+        # SalesEngine(討論→評価)とOutreachService(承認された戦略の実行)
         self.strategy_planner = StrategyPlanner(self.sales_repo)
         self.strategy_executor = StrategyExecutor(self.sales_repo)
         self.sales_engine = SalesEngine(self.strategy_planner, self.strategy_executor, self.sales_repo)
         self.outreach_service = OutreachService(self.sales_repo)
-
-    async def run_strategy_cycle(
-        self, topic: str, context: str, constraint_ctx: ConstraintContext,
-        target_client_ids: Optional[list] = None, max_rounds: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """
-        討論(StrategyPlanner) → 評価(StrategyExecutor) → 承認されれば実行(OutreachService)
-        までを1回でまとめて行う。target_client_ids未指定の場合は、sales_repoのleadsテーブルから
-        stage='lead'のクライアントを自動的に対象にする(新規リードへのトライアル案内が主目的のため)。
-        max_roundsを指定すると、その回のみ討論のラウンド数上限を一時的に上書きする
-        (複雑な議題で3ラウンドでは収束しないケースが実際に確認されたため追加)。
-        """
-        original_max_rounds = self.strategy_planner.max_rounds
-        if max_rounds is not None:
-            self.strategy_planner.max_rounds = max_rounds
-        try:
-            result = await self.sales_engine.run_strategy_cycle(topic, context, constraint_ctx)
-        finally:
-            self.strategy_planner.max_rounds = original_max_rounds
-
-        if result["stage"] != "approved":
-            return {**result, "outreach": None}
-
-        if target_client_ids is None:
-            leads = await self.sales_repo.get_leads_by_stage("lead")
-            target_client_ids = [lead["client_id"] for lead in leads]
-
-        outreach_result = await self.outreach_service.run_from_strategy_result(result, target_client_ids)
-        return {**result, "outreach": outreach_result}
 
     async def create_execution_event(
         self,
@@ -87,6 +61,11 @@ class MasterOrchestrator:
         await self.db.save_quote(quote_data)
         await self.db.save_vetting_log({**vetting_result, "intent": intent, "client_id": client_id})
         await self.db.log_event("QUOTED", intent, f"Quote generated: {quote['quote_id']}", client_id)
+
+        # AuthGatewayの承認カウントはここでは加算しない。
+        # 「見積が出ただけ」は本当の意味での承認済み発注ではないため、
+        # Capture確定(complete_dispatch/execute_physical_task内)まで持ち越す。
+
         return {"event_id": quote["quote_id"]}
 
     async def log_security_alert(self, client_id: str, intent: str, reason: str) -> None:
@@ -96,7 +75,11 @@ class MasterOrchestrator:
             "intent": intent, "client_id": client_id
         })
         await self.db.log_event("DECLINED", intent, reason, client_id)
+        # 却下された発注はAuthGatewayの承認カウントに影響しない(record_order_completionを呼ばない)
+        # ConciergeServiceに却下理由を渡し、クライアントへ返す案内文を組み立ててもらう
         await self.concierge_service.notify_vetting_rejection(client_id, intent, reason)
+
+    # ---------- LINE連携: 現場実行(非同期フロー) ----------
 
     async def dispatch_to_worker(
         self, client_id: str, quote: Dict[str, Any], worker_line_user_id: Optional[str] = None,
@@ -265,7 +248,8 @@ class MasterOrchestrator:
         self, client_id: str, quote: Dict[str, Any], payment_method_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        [レガシー/テスト用フォールバック] worker_line_user_idが無い場合の同期実行パス。
+        [レガシー/テスト用フォールバック] worker_line_user_id指定が無く、かつ
+        登録済みワーカーが1人もいない場合の同期実行パス。
         実ワーカーとのLINE連携が無い環境での動作確認用に残している。
         本番でワーカーが登録されている場合は dispatch_to_worker() を使うこと。
         """
@@ -309,3 +293,42 @@ class MasterOrchestrator:
             "revenue_captured_usd": quote["price_usd"],
             "net_profit_usd": round(quote["price_usd"] * quote.get("margin_percent", 0) / 100, 2),
         }
+
+    # ---------- 営業エンジン(SalesEngine/OutreachService) ----------
+
+    async def run_strategy_cycle(
+        self, topic: str, context: str, constraint_ctx: ConstraintContext,
+        target_client_ids: Optional[List[str]] = None, max_rounds: Optional[int] = None,
+        skip_feature_detection: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        討論(StrategyPlanner) → 評価(StrategyExecutor) → 承認されれば実行(OutreachService)
+        までを1回でまとめて行う。target_client_ids未指定の場合は、sales_repoのleadsテーブルから
+        stage='lead'のクライアントを自動的に対象にする(新規リードへのトライアル案内が主目的のため)。
+
+        max_roundsを指定すると、その回のみ討論のラウンド数上限を一時的に上書きする
+        (複雑な議題で3ラウンドでは収束しないケースが実際に確認されたため追加)。
+
+        skip_feature_detection=Trueにすると、承認時のdetect_feature_request呼び出し
+        (LLM呼び出し1回分)を省略できる。応答速度を優先したい場合に使う
+        (2026-08-20の応答遅延調査を受けて追加)。
+        """
+        original_max_rounds = self.strategy_planner.max_rounds
+        if max_rounds is not None:
+            self.strategy_planner.max_rounds = max_rounds
+        try:
+            result = await self.sales_engine.run_strategy_cycle(
+                topic, context, constraint_ctx, skip_feature_detection=skip_feature_detection
+            )
+        finally:
+            self.strategy_planner.max_rounds = original_max_rounds
+
+        if result["stage"] != "approved":
+            return {**result, "outreach": None}
+
+        if target_client_ids is None:
+            leads = await self.sales_repo.get_leads_by_stage("lead")
+            target_client_ids = [lead["client_id"] for lead in leads]
+
+        outreach_result = await self.outreach_service.run_from_strategy_result(result, target_client_ids)
+        return {**result, "outreach": outreach_result}
