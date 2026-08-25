@@ -1,5 +1,4 @@
 import json
-import os
 from typing import Any, Dict, Optional
 
 from google import genai
@@ -20,19 +19,19 @@ class StrategyPlanner:
     保留判定を暫定的にここで代行する(Executor実装後はそちらに移す)。
 
     Gemini APIが有料プランで安価に使えることが判明したため、Groq/OpenRouterへの
-    移行は行わず、Geminiを継続利用する(2026-08-18)。無料枠のクォータ制約(1日20
-    リクエスト/モデル)に対しては、gemini_retry.pyの多段フォールバック
-    (gemini-3.7-flash -> gemini-3.6-flash -> gemini-2.5-flash)で耐性を持たせている。
+    移行は行わず、Geminiを継続利用する。無料枠のクォータ制約に対しては、
+    gemini_retry.pyの多段フォールバックで耐性を持たせている。
     """
 
     def __init__(
         self,
         sales_repo: SalesRepository,
         api_key: Optional[str] = None,
-        model: str = "gemini-3.6-flash",
+        model: str = "gemini-3.5-flash",
         max_rounds: int = 3,
     ):
         self.sales_repo = sales_repo
+        import os
         api_key = api_key or os.environ.get("GEMINI_API_KEY")
         self.client = genai.Client(api_key=api_key) if api_key else genai.Client()
         self.model = model
@@ -64,7 +63,26 @@ class StrategyPlanner:
             system_instruction=(
                 "あなたはGateway Xの営業戦略をレビューする批判担当(懐疑派)です。"
                 "提案担当とは独立した立場で、実行可能性・法的リスク・費用対効果の観点から"
-                "厳しく問題点を指摘してください。提案担当に同調しないでください。"
+                "厳しく問題点を指摘してください。提案担当に同調しないでください。\n\n"
+                "【重要】ただし、この営業エンジンの目的は能動的に戦略を立て、実行することです。"
+                "完璧な計画ができるまで承認しないと、いつまでも何も実行されなくなってしまいます。"
+                "以下の場合は、多少の見積もりの粗さや未検証の前提が残っていても承認(CONVERGED)して"
+                "ください:\n"
+                "- 提案が少数（5〜10社程度）の限定的なパイロット/PoCとして設計されている\n"
+                "- 明確な撤退条件(キルスイッチ)が示されている\n"
+                "- 法的リスク・重大な安全性の問題・回復不能な財務的損失のリスクが無い\n"
+                "この場合、財務モデルの精緻さや全社展開時の完成度を求めるのは過剰な要求です。"
+                "小さく試して学ぶことがパイロットの目的なので、「試してみないとわからない」"
+                "程度の不確実性は許容してください。\n\n"
+                "逆に、全社一斉展開や不可逆な意思決定(大規模な契約変更、後戻りできない"
+                "システム変更等)を伴う提案については、これまで通り厳しく審査してください。\n\n"
+                "【出力形式に関する厳密なルール】\n"
+                "承認する場合は、回答の1行目に、他の文字を一切付け加えず「CONVERGED」という"
+                "単語だけを書いてください(例:「CONVERGEDとは言えません」のように、他の語を"
+                "続けて書くことは絶対に禁止です。1行目は「CONVERGED」の7文字のみにしてください)。"
+                "2行目以降に理由を書くのは構いません。"
+                "承認しない場合は、1行目に「CONVERGED」という単語を絶対に使わず、"
+                "問題点の指摘から書き始めてください。"
             ),
         )
 
@@ -99,12 +117,18 @@ class StrategyPlanner:
             critique_prompt = (
                 "以下はB2B調達エージェント向けサービスの営業戦略案です。批判的にレビューし、"
                 "問題点を指摘してください。大きな問題がなく実行可能と判断できる場合のみ、"
-                "回答の最初の行に厳密に「CONVERGED」とだけ書いてください。\n\n"
+                "回答の1行目に他の文字を一切付け加えず「CONVERGED」という単語だけを"
+                "書いてください。\n\n"
                 f"戦略案:\n{revision}"
             )
             critique = await self._call_critic(critique_prompt)
 
-            if critique.strip().startswith("CONVERGED"):
+            # 収束判定: 1行目が厳密に「CONVERGED」と完全一致する場合のみ承認とみなす。
+            # 「CONVERGEDとは言えません」のように、批判担当が否定文の中で単語として言及した
+            # だけのケースを誤って承認扱いしてしまう不具合が実際に発生したため、
+            # startswith()による部分一致ではなく、1行目全体の完全一致に変更した(重要な修正)。
+            first_line = critique.strip().split("\n", 1)[0].strip()
+            if first_line == "CONVERGED":
                 converged = True
                 await self.sales_repo.update_debate_round(cycle_id, round_count, critique, revision)
                 break
