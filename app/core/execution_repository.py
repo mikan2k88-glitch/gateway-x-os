@@ -102,6 +102,17 @@ class ExecutionRepository:
                 return dict(row) if row else None
         return await asyncio.to_thread(_execute)
 
+    async def get_recent_dispatches(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """モニター用: 直近の派遣(dispatch)一覧をステータス問わず新しい順で返す"""
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT * FROM dispatches ORDER BY created_at DESC LIMIT ?", (limit,)
+                )
+                return [dict(row) for row in cursor.fetchall()]
+        return await asyncio.to_thread(_execute)
+
     async def get_dispatch_by_payment_intent(self, payment_intent_id: str) -> Optional[Dict[str, Any]]:
         """
         Stripeのチャージバック(dispute)Webhookはpayment_intent_idしか渡してこないため、
