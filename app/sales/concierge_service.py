@@ -34,7 +34,7 @@ class ConciergeService:
         self,
         sales_repo: SalesRepository,
         api_key: Optional[str] = None,
-        model: str = "gemini-3.6-flash",
+        model: str = "gemini-3.8-flash",
     ):
         self.sales_repo = sales_repo
         api_key = api_key or os.environ.get("GEMINI_API_KEY")
