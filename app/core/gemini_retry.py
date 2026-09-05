@@ -11,7 +11,7 @@ async def generate_content_with_retry(
     client: Any,
     max_attempts: int = 3,
     initial_delay: float = 2.0,
-    fallback_models: tuple = ("gemini-3.7-flash", "gemini-3.5-flash"),
+    fallback_models: tuple = ("gemini-3.7-flash", "gemini-3.6-flash"),
     **kwargs,
 ):
     """
@@ -35,6 +35,12 @@ async def generate_content_with_retry(
     フォールバックする無駄な待ち時間(1呼び出しあたり約90秒)が発生していたため、
     プライマリを実績のあるgemini-3.6-flashに変更し、3.7-flashはフォールバック側に
     回した(3.7の混雑が落ち着いたら再度プライマリに戻すことを検討)。
+
+    2026-09-05: gemini-3.8-flashのリリースに伴い、プライマリをgemini-3.8-flashに、
+    フォールバックをgemini-3.7-flash → gemini-3.6-flashの順に更新。3週間おきの
+    新Flashリリースのたびに相対的に古いモデルから先に混雑・縮退する傾向が観測されて
+    いるため、常に最新Flashをプライマリに、その前の2世代をフォールバックに置く方針とする。
+    gemini-3.5-flash以前はフォールバック候補から外した(世代が離れすぎているため)。
 
     全モデルが失敗した場合は最後の例外を送出する。呼び出し元(main.py)が
     genai_errors.ServerError/ClientErrorをキャッチしてクライアントには503/429を返す設計。
