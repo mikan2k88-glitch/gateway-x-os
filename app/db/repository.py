@@ -176,3 +176,38 @@ class DatabaseRepository:
                 """, (event_type, intent, detail, client_id))
                 conn.commit()
         await asyncio.to_thread(_execute)
+
+    async def get_recent_quotes(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """モニター用: 直近の見積(注文)一覧をステータス問わず新しい順で返す"""
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT * FROM quotes ORDER BY created_at DESC LIMIT ?", (limit,)
+                )
+                return [dict(row) for row in cursor.fetchall()]
+        return await asyncio.to_thread(_execute)
+
+    async def get_recent_events(
+        self, limit: int = 50, event_types: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        モニター用: 直近のイベントログを新しい順で返す。
+        event_types を指定すると、その種類のみに絞り込む(アラート専用ビュー等で使用)。
+        """
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                if event_types:
+                    placeholders = ",".join("?" for _ in event_types)
+                    cursor.execute(
+                        f"SELECT * FROM event_logs WHERE event_type IN ({placeholders}) "
+                        f"ORDER BY created_at DESC LIMIT ?",
+                        (*event_types, limit),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT * FROM event_logs ORDER BY created_at DESC LIMIT ?", (limit,)
+                    )
+                return [dict(row) for row in cursor.fetchall()]
+        return await asyncio.to_thread(_execute)
