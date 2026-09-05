@@ -27,7 +27,7 @@ class StrategyPlanner:
         self,
         sales_repo: SalesRepository,
         api_key: Optional[str] = None,
-        model: str = "gemini-3.5-flash",
+        model: str = "gemini-3.8-flash",
         max_rounds: int = 3,
     ):
         self.sales_repo = sales_repo
