@@ -69,6 +69,17 @@ class LineService:
             resp = await client.post(self.REPLY_URL, headers=headers, json=payload)
             return {"success": resp.status_code == 200, "status_code": resp.status_code}
 
+    async def notify_admin(self, text: str) -> Dict[str, Any]:
+        """
+        管理者(ユーザー本人)のLINEへアラートを送る。ワーカー向け一斉通知(push_message)とは
+        宛先が別(LINE_ADMIN_USER_ID)なので、ワーカーに混ざって届くことはない。
+        環境変数が未設定の場合は何もせず失敗を返すのみ(呼び出し側で例外にしない想定)。
+        """
+        admin_id = os.environ.get("LINE_ADMIN_USER_ID")
+        if not admin_id:
+            return {"success": False, "reason": "LINE_ADMIN_USER_ID not set"}
+        return await self.push_message(admin_id, f"【Gateway X 管理者アラート】\n{text}")
+
     def build_task_notification(self, execution_id: str, intent: str, tier: str) -> str:
         """ワーカーに送るタスク通知文面を組み立てる"""
         return (
