@@ -1,3 +1,4 @@
+import logging
 from typing import Dict, Any, Optional, List
 from app.db.repository import DatabaseRepository
 from app.core.pricing import PricingEngine
@@ -14,6 +15,9 @@ from app.sales.strategy_executor import StrategyExecutor
 from app.sales.sales_engine import SalesEngine
 from app.sales.outreach_service import OutreachService
 from app.sales.constraint_registry import ConstraintContext
+
+
+logger = logging.getLogger("gateway_x")
 
 
 class MasterOrchestrator:
@@ -49,6 +53,18 @@ class MasterOrchestrator:
         self.sales_engine = SalesEngine(self.strategy_planner, self.strategy_executor, self.sales_repo)
         self.outreach_service = OutreachService(self.sales_repo)
 
+    async def _notify_admin(self, text: str) -> None:
+        """
+        モニター用の管理者アラート通知。LINE_ADMIN_USER_ID未設定/送信失敗でも
+        本処理(決済・実行フロー)を止めないよう、例外を握りつぶしログのみ残す。
+        """
+        try:
+            result = await self.line_service.notify_admin(text)
+            if not result.get("success"):
+                logger.warning(f"[admin alert] notify failed: {result}")
+        except Exception as exc:
+            logger.warning(f"[admin alert] notify raised: {exc}")
+
     async def create_execution_event(
         self,
         client_id: str,
@@ -78,6 +94,7 @@ class MasterOrchestrator:
         # 却下された発注はAuthGatewayの承認カウントに影響しない(record_order_completionを呼ばない)
         # ConciergeServiceに却下理由を渡し、クライアントへ返す案内文を組み立ててもらう
         await self.concierge_service.notify_vetting_rejection(client_id, intent, reason)
+        await self._notify_admin(f"Vetting却下\nclient_id={client_id}\n理由: {reason}")
 
     # ---------- LINE連携: 現場実行(非同期フロー) ----------
 
@@ -114,6 +131,7 @@ class MasterOrchestrator:
         if not auth_result["success"]:
             await self.db.log_event("PAYMENT_AUTH_FAILED", intent, auth_result["reason"], client_id)
             await self.concierge_service.notify_payment_failure(client_id, quote["quote_id"], auth_result["reason"])
+            await self._notify_admin(f"決済(与信)失敗\nclient_id={client_id}\n理由: {auth_result['reason']}")
             return {"status": "PAYMENT_FAILED", "quote_id": quote["quote_id"], "reason": auth_result["reason"]}
 
         await self.db.log_event(
@@ -163,6 +181,7 @@ class MasterOrchestrator:
             if not capture_result["success"]:
                 await self.db.log_event("PAYMENT_CAPTURE_FAILED", intent, capture_result["reason"], client_id)
                 await self.concierge_service.notify_payment_failure(client_id, dispatch["quote_id"], capture_result["reason"])
+                await self._notify_admin(f"決済(売上確定)失敗\nclient_id={client_id}\n理由: {capture_result['reason']}")
                 await self.execution_repo.update_status(execution_id, "CAPTURE_FAILED")
                 return {"status": "CAPTURE_FAILED", "execution_id": execution_id, "reason": capture_result["reason"]}
 
@@ -215,6 +234,10 @@ class MasterOrchestrator:
                 f"execution_id={dispatch['execution_id']}, dispatch_status={dispatch['status']}",
                 dispatch["client_id"]
             )
+            await self._notify_admin(
+                f"チャージバック発生(要人力レビュー)\n"
+                f"execution_id={dispatch['execution_id']}\ndispatch_status={dispatch['status']}"
+            )
             return {
                 "status": "NEEDS_MANUAL_REVIEW", "payment_intent_id": payment_intent_id,
                 "execution_id": dispatch["execution_id"], "dispatch_status": dispatch["status"],
@@ -238,6 +261,10 @@ class MasterOrchestrator:
             f"execution_id={dispatch['execution_id']}, success={result.get('success')}",
             dispatch["client_id"]
         )
+        await self._notify_admin(
+            f"チャージバック発生・証拠自動提出済み\n"
+            f"execution_id={dispatch['execution_id']}\n提出結果: success={result.get('success')}"
+        )
         return {
             "status": "EVIDENCE_SUBMITTED", "payment_intent_id": payment_intent_id,
             "execution_id": dispatch["execution_id"], "evidence_text": evidence_text,
@@ -260,6 +287,7 @@ class MasterOrchestrator:
         if not auth_result["success"]:
             await self.db.log_event("PAYMENT_AUTH_FAILED", intent, auth_result["reason"], client_id)
             await self.concierge_service.notify_payment_failure(client_id, quote["quote_id"], auth_result["reason"])
+            await self._notify_admin(f"決済(与信)失敗\nclient_id={client_id}\n理由: {auth_result['reason']}")
             return {"status": "PAYMENT_FAILED", "quote_id": quote["quote_id"], "reason": auth_result["reason"]}
 
         await self.db.log_event(
@@ -281,6 +309,7 @@ class MasterOrchestrator:
         if not capture_result["success"]:
             await self.db.log_event("PAYMENT_CAPTURE_FAILED", intent, capture_result["reason"], client_id)
             await self.concierge_service.notify_payment_failure(client_id, quote["quote_id"], capture_result["reason"])
+            await self._notify_admin(f"決済(売上確定)失敗\nclient_id={client_id}\n理由: {capture_result['reason']}")
             return {"status": "CAPTURE_FAILED", "quote_id": quote["quote_id"], "reason": capture_result["reason"]}
 
         await self.db.log_event("CAPTURED", intent, f"payment_intent={auth_result['payment_intent_id']}", client_id)
