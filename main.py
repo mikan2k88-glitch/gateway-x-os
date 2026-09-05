@@ -14,6 +14,7 @@ from app.sales.concierge_service import create_concierge_router
 from app.sales.constraint_registry import ConstraintContext, ImplementationPhase, LegalRiskLevel
 from app.sales.quote_builder import QuoteBuilder
 from app.core.rate_limiter import RateLimiter
+from app.api.monitor import create_monitor_router
 from google.genai import errors as genai_errors
 
 # レートリミッター設定: 1クライアントあたり60秒間に20リクエストまで(DoS対策)
@@ -42,6 +43,8 @@ async def gemini_server_error_handler(request, exc: genai_errors.ServerError):
     ここで拾って綺麗な503を返す(素の500 Internal Server Errorでクラッシュさせない)。
     """
     logger.error(f"[Gemini] All models exhausted (ServerError), returning 503 to client: {exc}")
+    import asyncio
+    asyncio.create_task(orchestrator.line_service.notify_admin(f"Gemini全モデル障害(503)\n{exc}"))
     return JSONResponse(
         status_code=503,
         content={
@@ -81,6 +84,7 @@ app.include_router(create_auth_gateway_router(orchestrator.sales_repo))
 # ConciergeServiceの対話エンドポイント(/concierge/message)。自由記述の依頼から
 # intent/tier/estimated_cost_jpyを抽出し、不足があれば聞き返す質問を返す。
 app.include_router(create_concierge_router(orchestrator.concierge_service))
+app.include_router(create_monitor_router(orchestrator.db, orchestrator.sales_repo, orchestrator.execution_repo))
 
 
 class MCPToolCallRequest(BaseModel):
