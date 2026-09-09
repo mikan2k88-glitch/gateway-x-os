@@ -133,6 +133,9 @@ class ConciergeService:
         "あなた自身は発注の承認・却下やルールの変更など、実際の判断は行いません"
         "(判断はMasterOrchestratorが担うため、あなたは状況説明に徹してください)。"
         "分からないことは正直に分からないと答えてください。"
+        "回答はLINEのトーク画面にそのまま表示されるため、**太字**や見出し(#)、"
+        "箇条書きの-記号などのMarkdown装飾は一切使わず、プレーンテキストのみで"
+        "書いてください(改行と「・」による簡単な列挙は問題ありません)。"
     )
 
     async def handle_owner_message(self, message: str, db_repo) -> str:
@@ -167,7 +170,21 @@ class ConciergeService:
                 system_instruction=self._OWNER_CHAT_SYSTEM_INSTRUCTION,
             ),
         )
-        return (response.text or "").strip() or "うまく回答を生成できませんでした。もう一度お試しください。"
+        raw_reply = (response.text or "").strip()
+        return self._strip_markdown(raw_reply) or "うまく回答を生成できませんでした。もう一度お試しください。"
+
+    @staticmethod
+    def _strip_markdown(text: str) -> str:
+        """
+        LINEはMarkdownを解釈しないため、system_instructionで装飾を使わないよう
+        指示はしているが、念のためGeminiの出力に紛れ込んだ**太字**や見出し(#)、
+        箇条書きの-記号を機械的に除去しておく(二重対策)。
+        """
+        import re
+        text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+        text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+        text = re.sub(r"^[-*]\s+", "・", text, flags=re.MULTILINE)
+        return text
 
     async def notify_vetting_rejection(self, client_id: str, intent: str, reason: str) -> Dict[str, Any]:
         message = (
