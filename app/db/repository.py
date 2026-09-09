@@ -123,6 +123,15 @@ class DatabaseRepository:
 
             conn.commit()
 
+    async def get_capability_rules(self) -> List[Dict[str, Any]]:
+        """オーナー対話(Concierge)向け: 現在の実行可能性ルール一覧をそのまま返す"""
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT keyword, allowed, reason FROM capability_rules ORDER BY id")
+                return [dict(row) for row in cursor.fetchall()]
+        return await asyncio.to_thread(_execute)
+
     async def check_capability(self, intent: str) -> Dict[str, Any]:
         """
         依頼内容(intent)がGateway Xの実行可能な業務範囲かどうかを判定する。
