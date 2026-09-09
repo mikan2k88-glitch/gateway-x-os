@@ -126,6 +126,49 @@ class ConciergeService:
 
         return result
 
+    _OWNER_CHAT_SYSTEM_INSTRUCTION = (
+        "あなたはGateway X-OSのAIアシスタントです。サービスのオーナー本人とLINEで直接、"
+        "対話形式でやり取りしています。オーナーからの質問(対応可能な業務範囲、"
+        "直近の注文状況など)に、渡されたデータの範囲内で簡潔に日本語で答えてください。"
+        "あなた自身は発注の承認・却下やルールの変更など、実際の判断は行いません"
+        "(判断はMasterOrchestratorが担うため、あなたは状況説明に徹してください)。"
+        "分からないことは正直に分からないと答えてください。"
+    )
+
+    async def handle_owner_message(self, message: str, db_repo) -> str:
+        """
+        Conciergeのもう一つの入口: 外部AIクライアントではなく、オーナー本人との
+        LINE経由の双方向対話。判断ロジックは持たず、capability_rulesや直近の注文状況を
+        Geminiに渡して自然な受け答えをさせる「対話・I/O層」役に徹する。
+        """
+        rules = await db_repo.get_capability_rules()
+        recent_quotes = await db_repo.get_recent_quotes(limit=5)
+
+        rules_summary = "\n".join(
+            f"- {r['keyword']}: {'対応可' if r['allowed'] else '対応不可'}({r['reason']})"
+            for r in rules
+        )
+        quotes_summary = "\n".join(
+            f"- {q['quote_id']}: {q['intent'][:30]} / status={q['status']} / ${q['price_usd']}"
+            for q in recent_quotes
+        ) or "(直近の注文なし)"
+
+        prompt = (
+            f"【現在の実行可能性ルール】\n{rules_summary}\n\n"
+            f"【直近の注文(最大5件)】\n{quotes_summary}\n\n"
+            f"【オーナーからのメッセージ】\n{message}"
+        )
+
+        response = await generate_content_with_retry(
+            self.client,
+            model=self.model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=self._OWNER_CHAT_SYSTEM_INSTRUCTION,
+            ),
+        )
+        return (response.text or "").strip() or "うまく回答を生成できませんでした。もう一度お試しください。"
+
     async def notify_vetting_rejection(self, client_id: str, intent: str, reason: str) -> Dict[str, Any]:
         message = (
             f"申し訳ございませんが、今回のご依頼(intent: {intent})はお受けできませんでした。"
