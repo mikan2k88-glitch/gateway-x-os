@@ -84,7 +84,65 @@ class DatabaseRepository:
             )
             """)
 
+            # 実行可能性ルール(Gateway Xが実際に対応できる業務範囲かどうかの判定基準)。
+            # Vettingは「安全か/違法でないか」しか見ないため、これとは別に「この案件は
+            # タイミーワーカー経由の都内物理タスクとして遂行可能か」を判定する。
+            # learned_rules同様、実例(Company X等とのやり取り)を通じて追加・洗練していく想定。
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS capability_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                keyword TEXT NOT NULL,
+                allowed BOOLEAN NOT NULL,
+                reason TEXT NOT NULL,
+                source TEXT DEFAULT 'seed',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
+
+            cursor.execute("SELECT COUNT(*) FROM capability_rules")
+            if cursor.fetchone()[0] == 0:
+                # 初期シード: Gateway Xは「タイミーワーカーがLINE経由で受け取り、
+                # 現地で実行する都内の物理タスク」に特化している。ソフトウェア開発・
+                # 技術文書作成・データ処理等の「リモートで完結する知的労働」は対象外。
+                seed_rules = [
+                    ("プログラミング", False, "ソフトウェア開発はタイミーワーカーが現地で遂行できる物理タスクではありません"),
+                    ("コーディング", False, "コーディング作業はGateway Xの対応範囲外です(物理タスク専門)"),
+                    ("ローカライズ", False, "文書・ソフトウェアのローカライズはリモート知的労働のため対応範囲外です"),
+                    ("データ構造化", False, "データ処理・分析系のリモート知的労働は対応範囲外です"),
+                    ("LLM", False, "AI/LLM関連の技術タスクはタイミーワーカーの物理タスクに変換できません"),
+                    ("翻訳", False, "文書翻訳はリモート知的労働のため対応範囲外です"),
+                    ("行列", True, "行列確認・順番待ちは典型的な物理タスクです"),
+                    ("配達", True, "配達・受け取り代行は典型的な物理タスクです"),
+                    ("買い物", True, "買い物代行は典型的な物理タスクです"),
+                    ("確認", True, "現地確認・視察は典型的な物理タスクです"),
+                ]
+                cursor.executemany(
+                    "INSERT INTO capability_rules (keyword, allowed, reason, source) VALUES (?, ?, ?, 'seed')",
+                    seed_rules,
+                )
+
             conn.commit()
+
+    async def check_capability(self, intent: str) -> Dict[str, Any]:
+        """
+        依頼内容(intent)がGateway Xの実行可能な業務範囲かどうかを判定する。
+        capability_rulesに登録されたキーワードと部分一致するかで判定する簡易実装。
+        - allowed=False のキーワードに1つでも一致 → 対応不可(reasonを返す)
+        - 何もヒットしない場合は「デフォルト許可」(過検知よりも見逃しを許容する設計)
+        キーワード自体はDBに保存されているため、learned_rules同様、運用しながら
+        Render管理画面やSQL直接操作で追加・修正していける。
+        """
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT keyword, allowed, reason FROM capability_rules")
+                return [dict(row) for row in cursor.fetchall()]
+        rules = await asyncio.to_thread(_execute)
+
+        for rule in rules:
+            if not rule["allowed"] and rule["keyword"] in intent:
+                return {"feasible": False, "reason": rule["reason"], "matched_keyword": rule["keyword"]}
+        return {"feasible": True, "reason": None, "matched_keyword": None}
 
     async def save_quote(self, quote_data: Dict[str, Any]) -> None:
         def _execute():
