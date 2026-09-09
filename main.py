@@ -160,7 +160,22 @@ async def handle_mcp_tool_call(
             content={"status": "REJECTED", "reason": tier_check["reason"]}
         )
 
-    # 1. Vetting(キーワードフィルタ + セマンティック審査)
+    # 1. 実行可能性チェック(capability_rules): Vettingは安全性のみを見るため、
+    #    「そもそもタイミーワーカー経由の物理タスクとして遂行可能な内容か」を別途判定する。
+    #    ここで弾かれた案件はVettingにすら進まない(安全でも実行不可能な依頼は無意味なため)。
+    capability_result = await orchestrator.db.check_capability(intent)
+    if not capability_result["feasible"]:
+        await orchestrator.db.log_event("CAPABILITY_REJECTED", intent, capability_result["reason"], client_id)
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "NOT_FEASIBLE",
+                "reason": capability_result["reason"],
+                "matched_keyword": capability_result["matched_keyword"],
+            }
+        )
+
+    # 2. Vetting(キーワードフィルタ + セマンティック審査)
     vetting_result = await vetting_engine.evaluate(intent=intent, client_id=client_id)
     if not vetting_result["passed"]:
         background_tasks.add_task(
@@ -175,12 +190,12 @@ async def handle_mcp_tool_call(
             }
         )
 
-    # 2. Pricing (QuoteBuilder経由: PricingEngineの計算にトライアル割引を上乗せ)
+    # 3. Pricing (QuoteBuilder経由: PricingEngineの計算にトライアル割引を上乗せ)
     quote = await quote_builder.build_quote(
         client_id=client_id, estimated_cost_jpy=estimated_cost_jpy, tier=tier
     )
 
-    # 2.5 カーディング攻撃検知: 少額見積の大量発行パターンをチェック
+    # 3.5 カーディング攻撃検知: 少額見積の大量発行パターンをチェック
     await orchestrator.sales_repo.log_quote_attempt(client_id, quote["price_usd"])
     small_quote_count = await orchestrator.sales_repo.count_recent_small_quotes(
         client_id, CARDING_WINDOW_SECONDS, CARDING_PRICE_THRESHOLD_USD
@@ -197,7 +212,7 @@ async def handle_mcp_tool_call(
             content={"status": "FLAGGED_FOR_REVIEW", "reason": reason}
         )
 
-    # 3. Master Orchestrator（永続化。決済はここではまだ行わない）
+    # 4. Master Orchestrator（永続化。決済はここではまだ行わない）
     dispatch_event = await orchestrator.create_execution_event(
         client_id=client_id,
         intent=intent,
