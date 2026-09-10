@@ -88,10 +88,17 @@ class StrategyPlanner:
 
     # ---------- 討論ループ本体 ----------
 
-    async def run_debate_cycle(self, topic: str, context: str = "") -> Dict[str, Any]:
+    async def run_debate_cycle(
+        self, topic: str, context: str = "", capability_context: str = ""
+    ) -> Dict[str, Any]:
         """
         topic: 議題(例: 「新規セグメントAへの営業を強化すべきか」)
         context: 制約情報(法的リスク・実装フェーズ・API可用性等、呼び出し側から渡す)
+        capability_context: Gateway Xが実際に対応できる業務範囲(capability_rules由来)。
+            ConciergeService.get_capability_briefing()経由でMasterOrchestratorから渡される。
+            これが空のまま(従来通り)討論すると、Gateway Xが実際には対応できない
+            サービス(ソフトウェア開発・データ分析等)を前提にした戦略を提案・承認して
+            しまう欠陥が過去に発覚したため、討論の両者に必ず実データを見せるようにした。
         """
         past_cycles = await self.sales_repo.get_recent_cycles(limit=5)
         past_summary = "\n".join(
@@ -99,11 +106,18 @@ class StrategyPlanner:
             for c in past_cycles
         ) or "(過去事例なし)"
 
+        capability_block = (
+            f"Gateway Xが実際に対応可能な業務範囲:\n{capability_context}\n\n"
+            if capability_context else ""
+        )
+
         proposal_prompt = (
+            f"{capability_block}"
             f"議題: {topic}\n"
             f"制約・背景情報: {context}\n"
             f"過去の戦略サイクルの結果:\n{past_summary}\n\n"
-            "上記を踏まえ、具体的な営業戦略案を1つ提案してください。"
+            "上記(特にGateway Xが実際に対応可能な業務範囲)を踏まえ、"
+            "具体的な営業戦略案を1つ提案してください。"
         )
         proposal = await self._call_proposer(proposal_prompt)
         cycle_id = await self.sales_repo.start_strategy_cycle(proposal)
@@ -115,8 +129,11 @@ class StrategyPlanner:
 
         for round_count in range(1, self.max_rounds + 1):
             critique_prompt = (
-                "以下はB2B調達エージェント向けサービスの営業戦略案です。批判的にレビューし、"
-                "問題点を指摘してください。大きな問題がなく実行可能と判断できる場合のみ、"
+                f"{capability_block}"
+                "以下はB2B調達エージェント向けサービスの営業戦略案です。"
+                "特に、上記のGateway Xの実際の対応可能範囲から外れた提案になっていないかを"
+                "最優先で確認したうえで、批判的にレビューし、問題点を指摘してください。"
+                "大きな問題がなく実行可能と判断できる場合のみ、"
                 "回答の1行目に他の文字を一切付け加えず「CONVERGED」という単語だけを"
                 "書いてください。\n\n"
                 f"戦略案:\n{revision}"
