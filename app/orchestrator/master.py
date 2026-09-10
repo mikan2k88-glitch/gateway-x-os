@@ -346,11 +346,19 @@ class MasterOrchestrator:
         if max_rounds is not None:
             self.strategy_planner.max_rounds = max_rounds
         try:
+            # Conciergeから「Gateway Xが実際に対応可能な業務範囲」を取得し、討論に渡す。
+            # これが無いと、営業エンジンが実際には対応できないサービスを前提にした
+            # 戦略を提案・承認してしまう(過去に発覚した欠陥、Company Xの一件と同根)。
+            capability_context = await self.concierge_service.get_capability_briefing(self.db)
             result = await self.sales_engine.run_strategy_cycle(
-                topic, context, constraint_ctx, skip_feature_detection=skip_feature_detection
+                topic, context, constraint_ctx, skip_feature_detection=skip_feature_detection,
+                capability_context=capability_context,
             )
         finally:
             self.strategy_planner.max_rounds = original_max_rounds
+
+        # 営業エンジンのステータスをConciergeへ引き渡す(オーナー対話等で参照できるように)
+        self.concierge_service.record_cycle_result(result)
 
         if result["stage"] != "approved":
             return {**result, "outreach": None}
