@@ -5,3 +5,4 @@ pydantic
 httpx
 stripe
 google-generativeai
+psycopg2-binary
