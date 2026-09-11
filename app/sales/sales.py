@@ -1,16 +1,25 @@
+import os
 import sqlite3
 import asyncio
-import json
+import logging
 from typing import Dict, Any, List, Optional
+
+logger = logging.getLogger("gateway_x.sales")
+
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    POSTGRES_AVAILABLE = False
 
 
 class SalesRepository:
     """
     Gateway X-OS 営業エンジン(SalesEngine) 用データ層
 
-    既存の DatabaseRepository (repository.py / operations.py 想定) と同じ SQLite ファイルを
-    共有し、責務だけを分離する。StrategyKnowledgeBase は独立ストアを持たず、このクラスが
-    保持する accounts / leads / strategy_cycles / capacity_alerts の各テーブルがそれに当たる。
+    DATABASE_URL環境変数があればPostgres(Supabase、Company Xと共有)、
+    無ければSQLiteにフォールバックする(repository.py / execution_repository.py と同じ方針)。
 
     - accounts: AuthGateway が発注パターンの認証状態を照会するためのテーブル
     - leads: OutreachService が更新する lead -> trial -> active のリード状態
@@ -29,11 +38,16 @@ class SalesRepository:
     """
 
     def __init__(self, db_path: str = "gateway_x.db"):
-        # repository.py と同じ db_path を渡して同一DBファイルを共有する想定
         self.db_path = db_path
+        self.db_url = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'")
+        if self.db_url.startswith("postgres://"):
+            self.db_url = self.db_url.replace("postgres://", "postgresql://", 1)
+        self.use_postgres = bool(self.db_url) and POSTGRES_AVAILABLE
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
+    def _get_connection(self):
+        if self.use_postgres:
+            return psycopg2.connect(self.db_url, cursor_factory=RealDictCursor)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -43,25 +57,28 @@ class SalesRepository:
     def _init_db(self):
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            pg = self.use_postgres
+            id_pk = "SERIAL PRIMARY KEY" if pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
+            real = "DOUBLE PRECISION" if pg else "REAL"
+            bool_false = "BOOLEAN DEFAULT FALSE" if pg else "BOOLEAN DEFAULT 0"
+            bool_true = "BOOLEAN DEFAULT TRUE" if pg else "BOOLEAN DEFAULT 1"
 
-            # AuthGateway が「過去3回以上・同一パターンで承認済みか」を判定する際に参照する
-            cursor.execute("""
+            cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS accounts (
                 client_id TEXT PRIMARY KEY,
                 company_name TEXT,
                 status TEXT DEFAULT 'lead',
                 approved_pattern_count INTEGER DEFAULT 0,
                 last_pattern_signature TEXT,
-                auth_verified BOOLEAN DEFAULT 0,
+                auth_verified {bool_false},
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """)
 
-            # OutreachService が lead -> trial -> active を更新
-            cursor.execute("""
+            cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS leads (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_pk},
                 client_id TEXT,
                 source TEXT,
                 stage TEXT DEFAULT 'lead',
@@ -71,10 +88,9 @@ class SalesRepository:
             )
             """)
 
-            # StrategyPlanner の討論サイクル + StrategyExecutor の判断結果
-            cursor.execute("""
+            cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS strategy_cycles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_pk},
                 cycle_status TEXT DEFAULT 'debating',
                 round_count INTEGER DEFAULT 0,
                 proposal TEXT,
@@ -87,43 +103,39 @@ class SalesRepository:
             )
             """)
 
-            # 供給キャパシティ逼迫のアラートログ
-            cursor.execute("""
+            cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS capacity_alerts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_pk},
                 supply_channel TEXT,
-                available_capacity REAL,
-                demand REAL,
+                available_capacity {real},
+                demand {real},
                 alert_level TEXT,
                 action_taken TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """)
 
-            # カーディング攻撃検知用: 見積発行試行のログ
-            cursor.execute("""
+            cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS quote_attempts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_pk},
                 client_id TEXT,
-                price_usd REAL,
+                price_usd {real},
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """)
 
-            # LINE経由の現場ワーカー登録簿
-            cursor.execute("""
+            cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS workers (
                 line_user_id TEXT PRIMARY KEY,
                 display_name TEXT,
-                active BOOLEAN DEFAULT 1,
+                active {bool_true},
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """)
 
-            # 営業エンジンの討論から生まれた機能要望の記録簿
-            cursor.execute("""
+            cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS feature_requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_pk},
                 cycle_id INTEGER,
                 title TEXT,
                 description TEXT,
@@ -132,10 +144,9 @@ class SalesRepository:
             )
             """)
 
-            # ConciergeServiceの会話履歴
-            cursor.execute("""
+            cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS concierge_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_pk},
                 client_id TEXT,
                 role TEXT,
                 message TEXT,
@@ -144,6 +155,8 @@ class SalesRepository:
             """)
 
             conn.commit()
+            mode = "PostgreSQL (Supabase, Company Xと共有)" if pg else "SQLite"
+            logger.info(f"🗄️ SalesRepository: {mode} で初期化完了しました。")
 
     # ---------- accounts (AuthGateway) ----------
 
@@ -151,7 +164,8 @@ class SalesRepository:
         def _execute():
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT * FROM accounts WHERE client_id = ?", (client_id,))
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(f"SELECT * FROM accounts WHERE client_id = {ph}", (client_id,))
                 row = cursor.fetchone()
                 return dict(row) if row else None
         return await asyncio.to_thread(_execute)
@@ -172,22 +186,23 @@ class SalesRepository:
         def _execute():
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT * FROM accounts WHERE client_id = ?", (client_id,))
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(f"SELECT * FROM accounts WHERE client_id = {ph}", (client_id,))
                 row = cursor.fetchone()
                 if row is None:
-                    conn.execute("""
+                    cursor.execute(f"""
                     INSERT INTO accounts (client_id, status, approved_pattern_count,
                         last_pattern_signature, auth_verified)
-                    VALUES (?, 'active', 1, ?, 1)
+                    VALUES ({ph}, 'active', 1, {ph}, {"TRUE" if self.use_postgres else "1"})
                     """, (client_id, pattern_signature))
                 else:
                     same_pattern = row["last_pattern_signature"] == pattern_signature
                     new_count = row["approved_pattern_count"] + 1 if same_pattern else 1
-                    conn.execute("""
+                    cursor.execute(f"""
                     UPDATE accounts
-                    SET approved_pattern_count = ?, last_pattern_signature = ?,
-                        auth_verified = 1, updated_at = CURRENT_TIMESTAMP
-                    WHERE client_id = ?
+                    SET approved_pattern_count = {ph}, last_pattern_signature = {ph},
+                        auth_verified = {"TRUE" if self.use_postgres else "1"}, updated_at = CURRENT_TIMESTAMP
+                    WHERE client_id = {ph}
                     """, (new_count, pattern_signature, client_id))
                 conn.commit()
         await asyncio.to_thread(_execute)
@@ -197,9 +212,11 @@ class SalesRepository:
     async def create_lead(self, client_id: str, source: str, notes: str = "") -> None:
         def _execute():
             with self._get_connection() as conn:
-                conn.execute("""
+                cursor = conn.cursor()
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(f"""
                 INSERT INTO leads (client_id, source, stage, notes)
-                VALUES (?, ?, 'lead', ?)
+                VALUES ({ph}, {ph}, 'lead', {ph})
                 """, (client_id, source, notes))
                 conn.commit()
         await asyncio.to_thread(_execute)
@@ -208,9 +225,11 @@ class SalesRepository:
         """stage は 'lead' | 'trial' | 'active' を想定"""
         def _execute():
             with self._get_connection() as conn:
-                conn.execute("""
-                UPDATE leads SET stage = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE client_id = ?
+                cursor = conn.cursor()
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(f"""
+                UPDATE leads SET stage = {ph}, updated_at = CURRENT_TIMESTAMP
+                WHERE client_id = {ph}
                 """, (stage, client_id))
                 conn.commit()
         await asyncio.to_thread(_execute)
@@ -219,7 +238,10 @@ class SalesRepository:
         def _execute():
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT * FROM leads WHERE stage = ? ORDER BY updated_at DESC", (stage,))
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(
+                    f"SELECT * FROM leads WHERE stage = {ph} ORDER BY updated_at DESC", (stage,)
+                )
                 return [dict(row) for row in cursor.fetchall()]
         return await asyncio.to_thread(_execute)
 
@@ -228,8 +250,9 @@ class SalesRepository:
         def _execute():
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                ph = "%s" if self.use_postgres else "?"
                 cursor.execute(
-                    "SELECT * FROM leads WHERE client_id = ? ORDER BY updated_at DESC LIMIT 1", (client_id,)
+                    f"SELECT * FROM leads WHERE client_id = {ph} ORDER BY updated_at DESC LIMIT 1", (client_id,)
                 )
                 row = cursor.fetchone()
                 return dict(row) if row else None
@@ -240,12 +263,21 @@ class SalesRepository:
     async def start_strategy_cycle(self, proposal: str) -> int:
         def _execute():
             with self._get_connection() as conn:
-                cursor = conn.execute("""
-                INSERT INTO strategy_cycles (cycle_status, round_count, proposal)
-                VALUES ('debating', 1, ?)
-                """, (proposal,))
+                cursor = conn.cursor()
+                if self.use_postgres:
+                    cursor.execute("""
+                    INSERT INTO strategy_cycles (cycle_status, round_count, proposal)
+                    VALUES ('debating', 1, %s) RETURNING id
+                    """, (proposal,))
+                    new_id = cursor.fetchone()["id"]
+                else:
+                    cursor.execute("""
+                    INSERT INTO strategy_cycles (cycle_status, round_count, proposal)
+                    VALUES ('debating', 1, ?)
+                    """, (proposal,))
+                    new_id = cursor.lastrowid
                 conn.commit()
-                return cursor.lastrowid
+                return new_id
         return await asyncio.to_thread(_execute)
 
     async def update_debate_round(
@@ -253,10 +285,12 @@ class SalesRepository:
     ) -> None:
         def _execute():
             with self._get_connection() as conn:
-                conn.execute("""
+                cursor = conn.cursor()
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(f"""
                 UPDATE strategy_cycles
-                SET round_count = ?, critique = ?, revision = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
+                SET round_count = {ph}, critique = {ph}, revision = {ph}, updated_at = CURRENT_TIMESTAMP
+                WHERE id = {ph}
                 """, (round_count, critique, revision, cycle_id))
                 conn.commit()
         await asyncio.to_thread(_execute)
@@ -265,11 +299,13 @@ class SalesRepository:
         """status は 'approved' | 'rejected' | 'pending'(3ラウンド未収束)を想定"""
         def _execute():
             with self._get_connection() as conn:
-                conn.execute("""
+                cursor = conn.cursor()
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(f"""
                 UPDATE strategy_cycles
-                SET cycle_status = ?, executor_decision = ?, executor_reason = ?,
+                SET cycle_status = {ph}, executor_decision = {ph}, executor_reason = {ph},
                     updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
+                WHERE id = {ph}
                 """, (status, decision, reason, cycle_id))
                 conn.commit()
         await asyncio.to_thread(_execute)
@@ -279,9 +315,8 @@ class SalesRepository:
         def _execute():
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
-                SELECT * FROM strategy_cycles ORDER BY id DESC LIMIT ?
-                """, (limit,))
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(f"SELECT * FROM strategy_cycles ORDER BY id DESC LIMIT {ph}", (limit,))
                 return [dict(row) for row in cursor.fetchall()]
         return await asyncio.to_thread(_execute)
 
@@ -306,10 +341,12 @@ class SalesRepository:
     ) -> None:
         def _execute():
             with self._get_connection() as conn:
-                conn.execute("""
+                cursor = conn.cursor()
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(f"""
                 INSERT INTO capacity_alerts
                 (supply_channel, available_capacity, demand, alert_level, action_taken)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES ({ph}, {ph}, {ph}, {ph}, {ph})
                 """, (supply_channel, available_capacity, demand, alert_level, action_taken))
                 conn.commit()
         await asyncio.to_thread(_execute)
@@ -318,8 +355,9 @@ class SalesRepository:
         def _execute():
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
-                SELECT * FROM capacity_alerts WHERE supply_channel = ?
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(f"""
+                SELECT * FROM capacity_alerts WHERE supply_channel = {ph}
                 ORDER BY created_at DESC LIMIT 1
                 """, (supply_channel,))
                 row = cursor.fetchone()
@@ -331,9 +369,12 @@ class SalesRepository:
     async def log_quote_attempt(self, client_id: str, price_usd: float) -> None:
         def _execute():
             with self._get_connection() as conn:
-                conn.execute("""
-                INSERT INTO quote_attempts (client_id, price_usd) VALUES (?, ?)
-                """, (client_id, price_usd))
+                cursor = conn.cursor()
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(
+                    f"INSERT INTO quote_attempts (client_id, price_usd) VALUES ({ph}, {ph})",
+                    (client_id, price_usd)
+                )
                 conn.commit()
         await asyncio.to_thread(_execute)
 
@@ -347,12 +388,20 @@ class SalesRepository:
         def _execute():
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
-                SELECT COUNT(*) as cnt FROM quote_attempts
-                WHERE client_id = ?
-                  AND price_usd < ?
-                  AND created_at >= datetime('now', ?)
-                """, (client_id, price_threshold_usd, f"-{window_seconds} seconds"))
+                if self.use_postgres:
+                    cursor.execute("""
+                    SELECT COUNT(*) as cnt FROM quote_attempts
+                    WHERE client_id = %s
+                      AND price_usd < %s
+                      AND created_at >= NOW() - (%s * INTERVAL '1 second')
+                    """, (client_id, price_threshold_usd, window_seconds))
+                else:
+                    cursor.execute("""
+                    SELECT COUNT(*) as cnt FROM quote_attempts
+                    WHERE client_id = ?
+                      AND price_usd < ?
+                      AND created_at >= datetime('now', ?)
+                    """, (client_id, price_threshold_usd, f"-{window_seconds} seconds"))
                 row = cursor.fetchone()
                 return row["cnt"] if row else 0
         return await asyncio.to_thread(_execute)
@@ -363,13 +412,23 @@ class SalesRepository:
         """既に登録済みなら再登録扱い(display_name更新、activeをTrueに戻す)にする"""
         def _execute():
             with self._get_connection() as conn:
-                conn.execute("""
-                INSERT INTO workers (line_user_id, display_name, active)
-                VALUES (?, ?, 1)
-                ON CONFLICT(line_user_id) DO UPDATE SET
-                    display_name = excluded.display_name,
-                    active = 1
-                """, (line_user_id, display_name))
+                cursor = conn.cursor()
+                if self.use_postgres:
+                    cursor.execute("""
+                    INSERT INTO workers (line_user_id, display_name, active)
+                    VALUES (%s, %s, TRUE)
+                    ON CONFLICT (line_user_id) DO UPDATE SET
+                        display_name = EXCLUDED.display_name,
+                        active = TRUE
+                    """, (line_user_id, display_name))
+                else:
+                    cursor.execute("""
+                    INSERT INTO workers (line_user_id, display_name, active)
+                    VALUES (?, ?, 1)
+                    ON CONFLICT(line_user_id) DO UPDATE SET
+                        display_name = excluded.display_name,
+                        active = 1
+                    """, (line_user_id, display_name))
                 conn.commit()
         await asyncio.to_thread(_execute)
 
@@ -377,14 +436,18 @@ class SalesRepository:
         def _execute():
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT * FROM workers WHERE active = 1")
+                active_val = "TRUE" if self.use_postgres else "1"
+                cursor.execute(f"SELECT * FROM workers WHERE active = {active_val}")
                 return [dict(row) for row in cursor.fetchall()]
         return await asyncio.to_thread(_execute)
 
     async def deactivate_worker(self, line_user_id: str) -> None:
         def _execute():
             with self._get_connection() as conn:
-                conn.execute("UPDATE workers SET active = 0 WHERE line_user_id = ?", (line_user_id,))
+                cursor = conn.cursor()
+                ph = "%s" if self.use_postgres else "?"
+                false_val = "FALSE" if self.use_postgres else "0"
+                cursor.execute(f"UPDATE workers SET active = {false_val} WHERE line_user_id = {ph}", (line_user_id,))
                 conn.commit()
         await asyncio.to_thread(_execute)
 
@@ -393,9 +456,11 @@ class SalesRepository:
     async def create_feature_request(self, cycle_id: int, title: str, description: str) -> None:
         def _execute():
             with self._get_connection() as conn:
-                conn.execute("""
+                cursor = conn.cursor()
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(f"""
                 INSERT INTO feature_requests (cycle_id, title, description, status)
-                VALUES (?, ?, ?, 'open')
+                VALUES ({ph}, {ph}, {ph}, 'open')
                 """, (cycle_id, title, description))
                 conn.commit()
         await asyncio.to_thread(_execute)
@@ -416,9 +481,12 @@ class SalesRepository:
         """role は 'user' | 'concierge' を想定"""
         def _execute():
             with self._get_connection() as conn:
-                conn.execute("""
-                INSERT INTO concierge_messages (client_id, role, message) VALUES (?, ?, ?)
-                """, (client_id, role, message))
+                cursor = conn.cursor()
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(
+                    f"INSERT INTO concierge_messages (client_id, role, message) VALUES ({ph}, {ph}, {ph})",
+                    (client_id, role, message)
+                )
                 conn.commit()
         await asyncio.to_thread(_execute)
 
@@ -427,11 +495,12 @@ class SalesRepository:
         def _execute():
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(f"""
                 SELECT * FROM (
-                    SELECT * FROM concierge_messages WHERE client_id = ?
-                    ORDER BY id DESC LIMIT ?
-                ) ORDER BY id ASC
+                    SELECT * FROM concierge_messages WHERE client_id = {ph}
+                    ORDER BY id DESC LIMIT {ph}
+                ) AS recent ORDER BY id ASC
                 """, (client_id, limit))
                 return [dict(row) for row in cursor.fetchall()]
         return await asyncio.to_thread(_execute)
