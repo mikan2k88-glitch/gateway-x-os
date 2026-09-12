@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 from app.core.vetting import VettingEngine
+from app.core.semantic_capability import SemanticCapabilityReviewer
 from app.core.pricing import PricingEngine
 from app.orchestrator.master import MasterOrchestrator
 from app.api.v1_feedback import router as feedback_router
@@ -72,6 +73,7 @@ async def gemini_client_error_handler(request, exc: genai_errors.ClientError):
 
 
 vetting_engine = VettingEngine()
+semantic_capability_reviewer = SemanticCapabilityReviewer()
 pricing_engine = PricingEngine()
 orchestrator = MasterOrchestrator()
 rate_limiter = RateLimiter()
@@ -163,6 +165,8 @@ async def handle_mcp_tool_call(
     # 1. 実行可能性チェック(capability_rules): Vettingは安全性のみを見るため、
     #    「そもそもタイミーワーカー経由の物理タスクとして遂行可能な内容か」を別途判定する。
     #    ここで弾かれた案件はVettingにすら進まない(安全でも実行不可能な依頼は無意味なため)。
+    #
+    #    1a. キーワード完全一致(安価・高速)。明らかにNGな案件をここで即座に弾く。
     capability_result = await orchestrator.db.check_capability(intent)
     if not capability_result["feasible"]:
         await orchestrator.db.log_event("CAPABILITY_REJECTED", intent, capability_result["reason"], client_id)
@@ -172,6 +176,24 @@ async def handle_mcp_tool_call(
                 "status": "NOT_FEASIBLE",
                 "reason": capability_result["reason"],
                 "matched_keyword": capability_result["matched_keyword"],
+            }
+        )
+
+    #    1b. セマンティック判定(Gemini)。キーワードには引っかからないが、
+    #        「物理タスクを装った技術・分析タスク」(例: 専用カメラ設置が要る現地解析、
+    #        実質デスクワークのデータアノテーション等)を意味理解で弾く。
+    #        2026-09-11、Company Xとの連携テストでキーワード方式の限界が発覚したため追加。
+    semantic_capability_result = await semantic_capability_reviewer.review(intent)
+    if not semantic_capability_result["feasible"]:
+        await orchestrator.db.log_event(
+            "CAPABILITY_REJECTED_SEMANTIC", intent, semantic_capability_result["reasoning"], client_id
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "NOT_FEASIBLE",
+                "reason": semantic_capability_result["reasoning"],
+                "matched_keyword": None,
             }
         )
 
@@ -313,7 +335,9 @@ async def line_webhook(request: Request):
         # データを参照するのみで、Concierge自身は状況説明に徹する)。
         admin_line_id = os.environ.get("LINE_ADMIN_USER_ID")
         if admin_line_id and line_user_id == admin_line_id:
-            reply_text = await orchestrator.concierge_service.handle_owner_message(text, orchestrator.db)
+            reply_text = await orchestrator.concierge_service.handle_owner_message(
+                text, orchestrator.db, orchestrator.sales_repo
+            )
             if reply_token:
                 await orchestrator.line_service.reply_message(reply_token, reply_text)
             results.append({"status": "OWNER_CHAT_REPLIED", "line_user_id": line_user_id})
