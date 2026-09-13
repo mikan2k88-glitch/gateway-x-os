@@ -22,6 +22,11 @@ ALERT_EVENT_TYPES = [
     "CHARGEBACK_NEEDS_MANUAL_REVIEW",
     "CHARGEBACK_EVIDENCE_SUBMITTED",
     "CHARGEBACK_UNRESOLVED",
+    # 実行可能性チェックによる却下(2026-09-11追加)。Company X等からの依頼のうち
+    # 「物理タスクとして対応不可」だった件数・傾向を把握し、AIエージェント実行エンジンの
+    # 必要性(実需)を判断する材料にするため、キーワード層/セマンティック層の両方を含める。
+    "CAPABILITY_REJECTED",
+    "CAPABILITY_REJECTED_SEMANTIC",
 ]
 
 
