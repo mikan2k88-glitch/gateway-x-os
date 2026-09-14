@@ -254,6 +254,7 @@ async def handle_mcp_tool_call(
     return {
         "status": "QUOTED",
         "quote_id": quote["quote_id"],
+        "intent": intent,
         "tier": quote["tier"],
         "channel": quote["channel"],
         "price_usd": quote["price_usd"],
