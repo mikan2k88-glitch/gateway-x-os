@@ -14,6 +14,8 @@ from app.sales.strategy_planner import StrategyPlanner
 from app.sales.strategy_executor import StrategyExecutor
 from app.sales.sales_engine import SalesEngine
 from app.sales.outreach_service import OutreachService
+from app.sales.opportunity_scout import OpportunityScout
+from app.core.digital_execution_engine import DigitalTaskEngine
 from app.sales.constraint_registry import ConstraintContext
 
 
@@ -52,6 +54,8 @@ class MasterOrchestrator:
         self.strategy_executor = StrategyExecutor(self.sales_repo)
         self.sales_engine = SalesEngine(self.strategy_planner, self.strategy_executor, self.sales_repo)
         self.outreach_service = OutreachService(self.sales_repo)
+        self.opportunity_scout = OpportunityScout()
+        self.digital_task_engine = DigitalTaskEngine()
 
     async def _notify_admin(self, text: str) -> None:
         """
@@ -159,6 +163,58 @@ class MasterOrchestrator:
         return {
             "status": "DISPATCHED", "quote_id": quote["quote_id"], "execution_id": execution_id,
             "notified_workers": len(target_ids),
+        }
+
+    async def dispatch_digital_task(
+        self, client_id: str, quote: Dict[str, Any], payment_method_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        デジタルタスク(channel="digital")用の発注実行。物理タスクと異なり現場作業の
+        非同期完了報告を待つ必要が無いため、与信(Auth)→即実行(DigitalTaskEngine)→
+        売上確定(Capture)までを1リクエスト内で完結させる。
+        """
+        intent = quote.get("intent", "")
+        execution_id = f"exec_{quote['quote_id']}"
+
+        auth_result = await self.stripe_service.authorize_payment(quote, payment_method_id)
+        if not auth_result["success"]:
+            await self.db.log_event("PAYMENT_AUTH_FAILED", intent, auth_result["reason"], client_id)
+            await self.concierge_service.notify_payment_failure(client_id, quote["quote_id"], auth_result["reason"])
+            await self._notify_admin(f"決済(与信)失敗\nclient_id={client_id}\n理由: {auth_result['reason']}")
+            return {"status": "PAYMENT_FAILED", "quote_id": quote["quote_id"], "reason": auth_result["reason"]}
+
+        await self.execution_repo.create_dispatch(execution_id, {
+            "client_id": client_id, "quote_id": quote["quote_id"],
+            "payment_intent_id": auth_result["payment_intent_id"], "tier": quote.get("tier"), "intent": intent,
+            "channel": "digital",
+            "price_usd": quote["price_usd"], "margin_percent": quote.get("margin_percent", 0),
+        })
+
+        engine_result = await self.digital_task_engine.execute(intent)
+        if not engine_result["success"]:
+            # 成果物生成に失敗した場合は与信を解放し、Capture(売上確定)は行わない
+            await self.stripe_service.cancel_payment(auth_result["payment_intent_id"], reason="digital_execution_failed")
+            await self.execution_repo.update_status(execution_id, "EXECUTION_FAILED")
+            await self.db.log_event("DIGITAL_EXECUTION_FAILED", intent, engine_result["reason"], client_id)
+            await self._notify_admin(f"デジタルタスク実行失敗\nclient_id={client_id}\n理由: {engine_result['reason']}")
+            return {"status": "EXECUTION_FAILED", "quote_id": quote["quote_id"], "reason": engine_result["reason"]}
+
+        capture_result = await self.stripe_service.capture_payment(auth_result["payment_intent_id"])
+        if not capture_result["success"]:
+            await self.db.log_event("PAYMENT_CAPTURE_FAILED", intent, capture_result["reason"], client_id)
+            await self._notify_admin(f"決済(売上確定)失敗\nclient_id={client_id}\n理由: {capture_result['reason']}")
+            await self.execution_repo.update_status(execution_id, "CAPTURE_FAILED")
+            return {
+                "status": "CAPTURE_FAILED", "quote_id": quote["quote_id"],
+                "reason": capture_result["reason"], "deliverable": engine_result["deliverable"],
+            }
+
+        await self.execution_repo.complete_digital_dispatch(execution_id, engine_result["deliverable"])
+        await self.db.log_event("DIGITAL_TASK_COMPLETED", intent, f"execution_id={execution_id}", client_id)
+
+        return {
+            "status": "COMPLETED", "quote_id": quote["quote_id"], "execution_id": execution_id,
+            "deliverable": engine_result["deliverable"],
         }
 
     async def complete_dispatch(self, execution_id: str, field_status: str) -> Dict[str, Any]:
@@ -326,7 +382,7 @@ class MasterOrchestrator:
     # ---------- 営業エンジン(SalesEngine/OutreachService) ----------
 
     async def run_strategy_cycle(
-        self, topic: str, context: str, constraint_ctx: ConstraintContext,
+        self, topic: str = "", context: str = "", constraint_ctx: ConstraintContext = None,
         target_client_ids: Optional[List[str]] = None, max_rounds: Optional[int] = None,
         skip_feature_detection: bool = False,
     ) -> Dict[str, Any]:
@@ -335,6 +391,11 @@ class MasterOrchestrator:
         までを1回でまとめて行う。target_client_ids未指定の場合は、sales_repoのleadsテーブルから
         stage='lead'のクライアントを自動的に対象にする(新規リードへのトライアル案内が主目的のため)。
 
+        topic未指定の場合、OpportunityScoutがGateway Xの実際の対応可能範囲を踏まえて
+        議題を自動発掘する。これにより、Company X(頻繁に改修される不安定な外部依存先)からの
+        発注が無い状態でも、営業エンジンが自律的に案件を発掘・討論できるようにした
+        (2026-09-11、Company Xに依存しない自走方針への転換を受けて追加)。
+
         max_roundsを指定すると、その回のみ討論のラウンド数上限を一時的に上書きする
         (複雑な議題で3ラウンドでは収束しないケースが実際に確認されたため追加)。
 
@@ -342,14 +403,31 @@ class MasterOrchestrator:
         (LLM呼び出し1回分)を省略できる。応答速度を優先したい場合に使う
         (2026-08-20の応答遅延調査を受けて追加)。
         """
+        if constraint_ctx is None:
+            constraint_ctx = ConstraintContext()
+
+        # Conciergeから「Gateway Xが実際に対応可能な業務範囲」を取得し、討論に渡す。
+        # これが無いと、営業エンジンが実際には対応できないサービスを前提にした
+        # 戦略を提案・承認してしまう(過去に発覚した欠陥、Company Xの一件と同根)。
+        capability_context = await self.concierge_service.get_capability_briefing(self.db)
+        digital_rules = await self.db.get_digital_capability_rules()
+        digital_capability_context = "\n".join(
+            f"- {r['keyword']}: {'対応可' if r['allowed'] else '対応不可'}({r['reason']})"
+            for r in digital_rules
+        )
+
+        if not topic:
+            scouted = await self.opportunity_scout.scout(capability_context, digital_capability_context)
+            topic = scouted["topic"]
+            context = context or scouted["context"]
+            await self.db.log_event(
+                "OPPORTUNITY_SCOUTED", topic, f"channel={scouted['channel']}, context={context}", "gateway_x_self"
+            )
+
         original_max_rounds = self.strategy_planner.max_rounds
         if max_rounds is not None:
             self.strategy_planner.max_rounds = max_rounds
         try:
-            # Conciergeから「Gateway Xが実際に対応可能な業務範囲」を取得し、討論に渡す。
-            # これが無いと、営業エンジンが実際には対応できないサービスを前提にした
-            # 戦略を提案・承認してしまう(過去に発覚した欠陥、Company Xの一件と同根)。
-            capability_context = await self.concierge_service.get_capability_briefing(self.db)
             result = await self.sales_engine.run_strategy_cycle(
                 topic, context, constraint_ctx, skip_feature_detection=skip_feature_detection,
                 capability_context=capability_context,
