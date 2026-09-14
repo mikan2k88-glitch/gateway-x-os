@@ -55,6 +55,7 @@ class DatabaseRepository:
                     client_id TEXT,
                     intent TEXT,
                     tier TEXT,
+                    channel TEXT DEFAULT 'physical',
                     price_usd DOUBLE PRECISION,
                     cost_jpy DOUBLE PRECISION,
                     margin_percent DOUBLE PRECISION,
@@ -112,6 +113,16 @@ class DatabaseRepository:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS digital_capability_rules (
+                    id SERIAL PRIMARY KEY,
+                    keyword TEXT NOT NULL,
+                    allowed BOOLEAN NOT NULL,
+                    reason TEXT NOT NULL,
+                    source TEXT DEFAULT 'seed',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """)
             else:
                 cursor.execute("""
                 CREATE TABLE IF NOT EXISTS quotes (
@@ -119,6 +130,7 @@ class DatabaseRepository:
                     client_id TEXT,
                     intent TEXT,
                     tier TEXT,
+                    channel TEXT DEFAULT 'physical',
                     price_usd REAL,
                     cost_jpy REAL,
                     margin_percent REAL,
@@ -176,6 +188,26 @@ class DatabaseRepository:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS digital_capability_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    keyword TEXT NOT NULL,
+                    allowed BOOLEAN NOT NULL,
+                    reason TEXT NOT NULL,
+                    source TEXT DEFAULT 'seed',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """)
+
+            # 既存(稼働中)のquotesテーブルには channel 列が無い可能性があるため、
+            # CREATE TABLE IF NOT EXISTSでは反映されない分をマイグレーションで補う。
+            if self.use_postgres:
+                cursor.execute("ALTER TABLE quotes ADD COLUMN IF NOT EXISTS channel TEXT DEFAULT 'physical'")
+            else:
+                try:
+                    cursor.execute("ALTER TABLE quotes ADD COLUMN channel TEXT DEFAULT 'physical'")
+                except sqlite3.OperationalError:
+                    pass  # 既に列が存在する場合(duplicate column name)はスキップ
 
             cursor.execute("SELECT COUNT(*) FROM capability_rules")
             row = cursor.fetchone()
@@ -202,6 +234,36 @@ class DatabaseRepository:
                     cursor.executemany(
                         "INSERT INTO capability_rules (keyword, allowed, reason, source) VALUES (?, ?, ?, 'seed')",
                         seed_rules,
+                    )
+
+            cursor.execute("SELECT COUNT(*) FROM digital_capability_rules")
+            row = cursor.fetchone()
+            digital_count = row["count"] if self.use_postgres else row[0]
+            if digital_count == 0:
+                # Gateway X自身(Gemini)がその場で完結できるデジタル業務のホワイトリスト。
+                # 物理タスクとしては不可(capability_rulesでNG)でも、ここでallowed=Trueなら
+                # DigitalTaskEngineが即時実行する(2026-09-11、内部仕事エンジン新設に伴い追加)。
+                # ソフトウェア開発等、実行環境を要するものはまだ対応範囲外として明示的に除外。
+                digital_seed_rules = [
+                    ("翻訳", True, "言語間の翻訳はGemini自身が直接完結できるデジタル業務です"),
+                    ("要約", True, "文章の要約はGemini自身が直接完結できるデジタル業務です"),
+                    ("リサーチ", True, "一般知識に基づく調査・情報整理はGemini自身で対応可能です"),
+                    ("記事作成", True, "文章・記事の作成はGemini自身で対応可能です"),
+                    ("データ整形", True, "テキストデータの整形・構造化はGemini自身で対応可能です"),
+                    ("文章校正", True, "文章の校正・添削はGemini自身で対応可能です"),
+                    ("プログラミング", False, "実行環境を要する本格的なソフトウェア開発は現状のデジタルエンジンの対応範囲外です"),
+                    ("コーディング", False, "実行環境を要する本格的なコーディングは現状のデジタルエンジンの対応範囲外です"),
+                    ("ソフトウェア開発", False, "実行環境を要する本格的なソフトウェア開発は現状のデジタルエンジンの対応範囲外です"),
+                ]
+                if self.use_postgres:
+                    cursor.executemany(
+                        "INSERT INTO digital_capability_rules (keyword, allowed, reason, source) VALUES (%s, %s, %s, 'seed')",
+                        digital_seed_rules,
+                    )
+                else:
+                    cursor.executemany(
+                        "INSERT INTO digital_capability_rules (keyword, allowed, reason, source) VALUES (?, ?, ?, 'seed')",
+                        digital_seed_rules,
                     )
 
             conn.commit()
@@ -236,6 +298,44 @@ class DatabaseRepository:
                 return {"feasible": False, "reason": rule["reason"], "matched_keyword": rule["keyword"]}
         return {"feasible": True, "reason": None, "matched_keyword": None}
 
+    async def get_digital_capability_rules(self) -> List[Dict[str, Any]]:
+        """OpportunityScout/オーナー対話向け: デジタル実行可能性ルール一覧を返す"""
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT keyword, allowed, reason FROM digital_capability_rules ORDER BY id")
+                return [dict(row) for row in cursor.fetchall()]
+        return await asyncio.to_thread(_execute)
+
+    async def check_digital_capability(self, intent: str) -> Dict[str, Any]:
+        """
+        依頼内容(intent)がGateway X自身(DigitalTaskEngine)で完結できるデジタル業務か
+        どうかを判定する。物理タスクとして不可(check_capabilityがFalse)だった場合の
+        フォールバック判定として使う。
+        """
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT keyword, allowed, reason FROM digital_capability_rules")
+                return [dict(row) for row in cursor.fetchall()]
+        rules = await asyncio.to_thread(_execute)
+
+        disallowed_hit = None
+        allowed_hit = None
+        for rule in rules:
+            if rule["keyword"] in intent:
+                if not rule["allowed"]:
+                    disallowed_hit = rule
+                    break
+                if allowed_hit is None:
+                    allowed_hit = rule
+
+        if disallowed_hit:
+            return {"feasible": False, "reason": disallowed_hit["reason"], "matched_keyword": disallowed_hit["keyword"]}
+        if allowed_hit:
+            return {"feasible": True, "reason": allowed_hit["reason"], "matched_keyword": allowed_hit["keyword"]}
+        return {"feasible": False, "reason": "デジタル業務ホワイトリストに一致するキーワードがありません", "matched_keyword": None}
+
     async def save_quote(self, quote_data: Dict[str, Any]) -> None:
         def _execute():
             with self._get_connection() as conn:
@@ -245,6 +345,7 @@ class DatabaseRepository:
                     quote_data.get("client_id", "anonymous"),
                     quote_data.get("intent", ""),
                     quote_data.get("tier", "economy"),
+                    quote_data.get("channel", "physical"),
                     quote_data.get("price_usd", 0.0),
                     quote_data.get("cost_jpy", 0.0),
                     quote_data.get("margin_percent", 0.0),
@@ -253,19 +354,19 @@ class DatabaseRepository:
                 if self.use_postgres:
                     cursor.execute("""
                     INSERT INTO quotes
-                    (quote_id, client_id, intent, tier, price_usd, cost_jpy, margin_percent, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    (quote_id, client_id, intent, tier, channel, price_usd, cost_jpy, margin_percent, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (quote_id) DO UPDATE SET
                         client_id = EXCLUDED.client_id, intent = EXCLUDED.intent,
-                        tier = EXCLUDED.tier, price_usd = EXCLUDED.price_usd,
+                        tier = EXCLUDED.tier, channel = EXCLUDED.channel, price_usd = EXCLUDED.price_usd,
                         cost_jpy = EXCLUDED.cost_jpy, margin_percent = EXCLUDED.margin_percent,
                         status = EXCLUDED.status
                     """, params)
                 else:
                     cursor.execute("""
                     INSERT OR REPLACE INTO quotes
-                    (quote_id, client_id, intent, tier, price_usd, cost_jpy, margin_percent, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (quote_id, client_id, intent, tier, channel, price_usd, cost_jpy, margin_percent, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, params)
                 conn.commit()
         await asyncio.to_thread(_execute)
