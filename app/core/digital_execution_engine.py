@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from typing import Any, Dict, Optional
 
@@ -6,6 +7,8 @@ from google import genai
 from google.genai import types
 
 from .gemini_retry import generate_content_with_retry
+
+logger = logging.getLogger("gateway_x.digital_execution_engine")
 
 
 class DigitalTaskEngine:
@@ -126,14 +129,19 @@ class DigitalTaskEngine:
 
             if not deliverable:
                 last_reason = "成果物の生成に失敗しました(空の応答)。"
+                logger.warning(f"[DigitalTaskEngine] attempt {attempt}/{self.max_attempts}: {last_reason}")
                 feedback = last_reason
                 continue
 
             review = await self._review(intent, deliverable)
             if review["approved"]:
+                logger.info(f"[DigitalTaskEngine] attempt {attempt}/{self.max_attempts}: レビュー承認")
                 return {"success": True, "deliverable": deliverable, "reason": None}
 
             last_reason = review["reason"]
+            logger.warning(
+                f"[DigitalTaskEngine] attempt {attempt}/{self.max_attempts}: レビュー却下 - {last_reason}"
+            )
             feedback = review["reason"]
 
         return {
