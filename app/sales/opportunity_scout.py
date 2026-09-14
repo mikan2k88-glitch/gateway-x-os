@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 from google import genai
 from google.genai import types
 
-from .gemini_retry import generate_content_with_retry
+from app.core.gemini_retry import generate_content_with_retry
 
 
 class OpportunityScout:
