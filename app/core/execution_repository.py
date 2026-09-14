@@ -57,6 +57,8 @@ class ExecutionRepository:
                 payment_intent_id TEXT,
                 tier TEXT,
                 intent TEXT,
+                channel TEXT DEFAULT 'physical',
+                deliverable TEXT,
                 price_usd {price_type},
                 margin_percent {price_type},
                 worker_line_user_id TEXT,
@@ -65,6 +67,19 @@ class ExecutionRepository:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """)
+            # 既存(稼働中)のdispatchesテーブルには無い可能性があるため、マイグレーションで補う。
+            if self.use_postgres:
+                cursor.execute("ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS channel TEXT DEFAULT 'physical'")
+                cursor.execute("ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS deliverable TEXT")
+            else:
+                for stmt in (
+                    "ALTER TABLE dispatches ADD COLUMN channel TEXT DEFAULT 'physical'",
+                    "ALTER TABLE dispatches ADD COLUMN deliverable TEXT",
+                ):
+                    try:
+                        cursor.execute(stmt)
+                    except sqlite3.OperationalError:
+                        pass  # 既に列が存在する場合はスキップ
             conn.commit()
             mode = "PostgreSQL (Supabase, Company Xと共有)" if self.use_postgres else "SQLite"
             logger.info(f"🗄️ ExecutionRepository: {mode} で初期化完了しました。")
@@ -76,19 +91,38 @@ class ExecutionRepository:
                 ph = "%s" if self.use_postgres else "?"
                 cursor.execute(f"""
                 INSERT INTO dispatches
-                (execution_id, client_id, quote_id, payment_intent_id, tier, intent,
+                (execution_id, client_id, quote_id, payment_intent_id, tier, intent, channel,
                  price_usd, margin_percent, worker_line_user_id, status)
-                VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, 'DISPATCHED')
+                VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, 'DISPATCHED')
                 """, (
                     execution_id, data.get("client_id"), data.get("quote_id"),
                     data.get("payment_intent_id"), data.get("tier"), data.get("intent"),
+                    data.get("channel", "physical"),
                     data.get("price_usd"), data.get("margin_percent"), data.get("worker_line_user_id"),
                 ))
                 conn.commit()
         await asyncio.to_thread(_execute)
 
+    async def complete_digital_dispatch(self, execution_id: str, deliverable: str) -> None:
+        """
+        DigitalTaskEngineが即座に成果物を生成できた場合に呼ぶ。物理タスクのような
+        DISPATCHED→(LINE Webhook経由の非同期報告)→COMPLETEDという2段階を経ず、
+        1回でCOMPLETEDまで進める。
+        """
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(f"""
+                UPDATE dispatches SET status = 'COMPLETED', deliverable = {ph}, updated_at = CURRENT_TIMESTAMP
+                WHERE execution_id = {ph}
+                """, (deliverable, execution_id))
+                conn.commit()
+        await asyncio.to_thread(_execute)
+
     async def get_dispatch(self, execution_id: str) -> Optional[Dict[str, Any]]:
         def _execute():
+
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 ph = "%s" if self.use_postgres else "?"
