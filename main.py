@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 from app.core.vetting import VettingEngine
+from app.core.semantic_capability import SemanticCapabilityReviewer
 from app.core.pricing import PricingEngine
 from app.orchestrator.master import MasterOrchestrator
 from app.api.v1_feedback import router as feedback_router
@@ -72,6 +73,7 @@ async def gemini_client_error_handler(request, exc: genai_errors.ClientError):
 
 
 vetting_engine = VettingEngine()
+semantic_capability_reviewer = SemanticCapabilityReviewer()
 pricing_engine = PricingEngine()
 orchestrator = MasterOrchestrator()
 rate_limiter = RateLimiter()
@@ -100,7 +102,9 @@ class ExecuteRequest(BaseModel):
 
 
 class StrategyCycleRequest(BaseModel):
-    topic: str
+    # 未指定(空文字)の場合、OpportunityScoutがGateway Xの対応可能範囲を踏まえて
+    # 議題を自動発掘する(Company X等の外部発注に依存せず自律的に案件発掘するため)。
+    topic: str = ""
     context: str = ""
     target_client_ids: list = None
     max_rounds: int = 3
@@ -160,22 +164,48 @@ async def handle_mcp_tool_call(
             content={"status": "REJECTED", "reason": tier_check["reason"]}
         )
 
-    # 1. 実行可能性チェック(capability_rules): Vettingは安全性のみを見るため、
-    #    「そもそもタイミーワーカー経由の物理タスクとして遂行可能な内容か」を別途判定する。
-    #    ここで弾かれた案件はVettingにすら進まない(安全でも実行不可能な依頼は無意味なため)。
+    # 1. 実行可能性チェック: Vettingは安全性のみを見るため、
+    #    「物理タスク(タイミーワーカー)」または「デジタルタスク(Gateway X自身=Gemini)」の
+    #    どちらかとして遂行可能かを別途判定する。どちらにも該当しない案件はVettingにすら
+    #    進まない(安全でも実行不可能な依頼は無意味なため)。
+    #
+    #    1a. 物理タスクとしてのキーワード完全一致(安価・高速)
+    channel = "physical"
     capability_result = await orchestrator.db.check_capability(intent)
-    if not capability_result["feasible"]:
-        await orchestrator.db.log_event("CAPABILITY_REJECTED", intent, capability_result["reason"], client_id)
-        return JSONResponse(
-            status_code=422,
-            content={
-                "status": "NOT_FEASIBLE",
-                "reason": capability_result["reason"],
-                "matched_keyword": capability_result["matched_keyword"],
-            }
-        )
+    physical_feasible = capability_result["feasible"]
 
-    # 2. Vetting(キーワードフィルタ + セマンティック審査)
+    #    1b. 物理タスクとして通過した場合のみ、セマンティック判定(Gemini)で
+    #        「物理タスクを装った技術・分析タスク」を意味理解で弾く。
+    #        2026-09-11、Company Xとの連携テストでキーワード方式の限界が発覚したため追加。
+    semantic_capability_result = None
+    if physical_feasible:
+        semantic_capability_result = await semantic_capability_reviewer.review(intent)
+        physical_feasible = semantic_capability_result["feasible"]
+
+    if not physical_feasible:
+        #    1c. 物理タスクとして不可でも、Gateway X自身(DigitalTaskEngine)が完結できる
+        #        デジタル業務ならそちらの経路(channel="digital")として受け付ける
+        #        (2026-09-11、内部仕事エンジン新設に伴い追加)。
+        digital_result = await orchestrator.db.check_digital_capability(intent)
+        if digital_result["feasible"]:
+            channel = "digital"
+        else:
+            rejection_reason = (
+                capability_result["reason"] if not capability_result["feasible"]
+                else semantic_capability_result["reasoning"]
+            )
+            event_type = "CAPABILITY_REJECTED" if not capability_result["feasible"] else "CAPABILITY_REJECTED_SEMANTIC"
+            await orchestrator.db.log_event(event_type, intent, rejection_reason, client_id)
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "status": "NOT_FEASIBLE",
+                    "reason": rejection_reason,
+                    "matched_keyword": capability_result.get("matched_keyword"),
+                }
+            )
+
+    # 2. Vetting(キーワードフィルタ + セマンティック審査)。物理/デジタル問わず必須。
     vetting_result = await vetting_engine.evaluate(intent=intent, client_id=client_id)
     if not vetting_result["passed"]:
         background_tasks.add_task(
@@ -194,6 +224,7 @@ async def handle_mcp_tool_call(
     quote = await quote_builder.build_quote(
         client_id=client_id, estimated_cost_jpy=estimated_cost_jpy, tier=tier
     )
+    quote["channel"] = channel
 
     # 3.5 カーディング攻撃検知: 少額見積の大量発行パターンをチェック
     await orchestrator.sales_repo.log_quote_attempt(client_id, quote["price_usd"])
@@ -223,7 +254,9 @@ async def handle_mcp_tool_call(
     return {
         "status": "QUOTED",
         "quote_id": quote["quote_id"],
+        "intent": intent,
         "tier": quote["tier"],
+        "channel": quote["channel"],
         "price_usd": quote["price_usd"],
         "estimated_cost_jpy": quote["estimated_cost_jpy"],
         "margin_percent": quote["margin_percent"],
@@ -250,7 +283,15 @@ async def handle_execute(request: ExecuteRequest):
     worker_line_user_id が無く、登録済みワーカーも1人もいない場合: レガシーの同期実行パス
     (execute_physical_task、プレ検収は固定で合格扱い)にフォールバックする。
     """
-    if request.worker_line_user_id:
+    if request.quote.get("channel") == "digital":
+        # デジタルタスクはタイミーワーカーへのLINE通知を経由せず、
+        # Gateway X自身(DigitalTaskEngine)がその場で完結させる。
+        result = await orchestrator.dispatch_digital_task(
+            client_id=request.client_id,
+            quote=request.quote,
+            payment_method_id=request.payment_method_id,
+        )
+    elif request.worker_line_user_id:
         result = await orchestrator.dispatch_to_worker(
             client_id=request.client_id,
             quote=request.quote,
@@ -313,7 +354,9 @@ async def line_webhook(request: Request):
         # データを参照するのみで、Concierge自身は状況説明に徹する)。
         admin_line_id = os.environ.get("LINE_ADMIN_USER_ID")
         if admin_line_id and line_user_id == admin_line_id:
-            reply_text = await orchestrator.concierge_service.handle_owner_message(text, orchestrator.db)
+            reply_text = await orchestrator.concierge_service.handle_owner_message(
+                text, orchestrator.db, orchestrator.sales_repo
+            )
             if reply_token:
                 await orchestrator.line_service.reply_message(reply_token, reply_text)
             results.append({"status": "OWNER_CHAT_REPLIED", "line_user_id": line_user_id})

@@ -40,6 +40,7 @@ class ConciergeService:
         api_key = api_key or os.environ.get("GEMINI_API_KEY")
         self.client = genai.Client(api_key=api_key) if api_key else genai.Client()
         self.model = model
+        self.latest_cycle_status: Optional[Dict[str, Any]] = None
 
     async def handle_first_contact(
         self, client_id: str, intent: str, tier: str, source: str = "auto_routed"
@@ -138,27 +139,57 @@ class ConciergeService:
         "書いてください(改行と「・」による簡単な列挙は問題ありません)。"
     )
 
-    async def handle_owner_message(self, message: str, db_repo) -> str:
-        """
-        Conciergeのもう一つの入口: 外部AIクライアントではなく、オーナー本人との
-        LINE経由の双方向対話。判断ロジックは持たず、capability_rulesや直近の注文状況を
-        Geminiに渡して自然な受け答えをさせる「対話・I/O層」役に徹する。
-        """
-        rules = await db_repo.get_capability_rules()
-        recent_quotes = await db_repo.get_recent_quotes(limit=5)
-
-        rules_summary = "\n".join(
+    @staticmethod
+    def _format_capability_rules(rules) -> str:
+        return "\n".join(
             f"- {r['keyword']}: {'対応可' if r['allowed'] else '対応不可'}({r['reason']})"
             for r in rules
         )
+
+    async def get_capability_briefing(self, db_repo) -> str:
+        """
+        営業エンジン(StrategyPlanner)向け: Gateway Xが実際に対応可能な業務範囲を
+        文字列で返す。ConciergeはAI-to-AI/オーナーとの対話だけでなく、社内の他コンポーネント
+        (営業エンジン)に対しても「Gateway Xの実情を伝える」情報ハブとして機能する。
+        """
+        rules = await db_repo.get_capability_rules()
+        return self._format_capability_rules(rules)
+
+    def record_cycle_result(self, result: Dict[str, Any]) -> None:
+        """
+        営業エンジン(SalesEngine)側から、戦略サイクル1回分の結果を受け取り保持する。
+        Concierge自身はここでも判断は行わず、単に最新状況を保持し、
+        オーナー対話(handle_owner_message)で参照できるようにするだけ。
+        """
+        self.latest_cycle_status = result
+
+    async def handle_owner_message(self, message: str, db_repo, sales_repo=None) -> str:
+        """
+        Conciergeのもう一つの入口: 外部AIクライアントではなく、オーナー本人との
+        LINE経由の双方向対話。判断ロジックは持たず、capability_rules・直近の注文状況・
+        営業エンジン(戦略サイクル)の状況をGeminiに渡して自然な受け答えをさせる
+        「対話・I/O層」役に徹する。
+        """
+        rules = await db_repo.get_capability_rules()
+        recent_quotes = await db_repo.get_recent_quotes(limit=5)
+        recent_cycles = await sales_repo.get_recent_cycles(limit=5) if sales_repo else []
+
+        rules_summary = self._format_capability_rules(rules)
         quotes_summary = "\n".join(
             f"- {q['quote_id']}: {q['intent'][:30]} / status={q['status']} / ${q['price_usd']}"
             for q in recent_quotes
         ) or "(直近の注文なし)"
+        cycles_summary = "\n".join(
+            f"- cycle_id={c['id']}: {c.get('cycle_status')} "
+            f"/ round={c['round_count']} / "
+            f"{(c.get('executor_reason') or c.get('revision') or c.get('proposal') or '')[:40]}"
+            for c in recent_cycles
+        ) or "(直近の営業エンジン実行なし)"
 
         prompt = (
             f"【現在の実行可能性ルール】\n{rules_summary}\n\n"
             f"【直近の注文(最大5件)】\n{quotes_summary}\n\n"
+            f"【営業エンジン(戦略サイクル、最大5件)】\n{cycles_summary}\n\n"
             f"【オーナーからのメッセージ】\n{message}"
         )
 

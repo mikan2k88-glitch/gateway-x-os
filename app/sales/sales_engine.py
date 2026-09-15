@@ -22,7 +22,7 @@ class SalesEngine:
 
     async def run_strategy_cycle(
         self, topic: str, context: str, constraint_ctx: ConstraintContext,
-        skip_feature_detection: bool = False,
+        skip_feature_detection: bool = False, capability_context: str = "",
     ) -> Dict[str, Any]:
         """
         討論 -> (収束したら)制約評価 まで一気通貫で実行する。
@@ -34,8 +34,12 @@ class SalesEngine:
         skip_feature_detection=True にすると、承認時のdetect_feature_request呼び出し
         (LLM呼び出し1回分)を省略できる。応答速度を優先したい場合に使う
         (2026-08-20の応答遅延調査を受けて追加)。
+
+        capability_context: ConciergeService経由で取得したGateway Xの実際の対応可能範囲。
+        討論の両者(提案担当・批判担当)に渡し、実際には対応できないサービスを前提にした
+        戦略が提案・承認されるのを防ぐ。
         """
-        debate_result = await self.planner.run_debate_cycle(topic, context)
+        debate_result = await self.planner.run_debate_cycle(topic, context, capability_context)
 
         if not debate_result["converged"]:
             return {
