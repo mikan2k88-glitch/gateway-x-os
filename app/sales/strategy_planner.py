@@ -120,7 +120,7 @@ class StrategyPlanner:
             "具体的な営業戦略案を1つ提案してください。"
         )
         proposal = await self._call_proposer(proposal_prompt)
-        cycle_id = await self.sales_repo.start_strategy_cycle(proposal)
+        cycle_id = await self.sales_repo.start_strategy_cycle(proposal, topic=topic)
 
         converged = False
         critique = ""
