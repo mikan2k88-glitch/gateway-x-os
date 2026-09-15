@@ -1,3 +1,4 @@
+import os
 import logging
 from typing import Dict, Any, Optional, List
 from app.db.repository import DatabaseRepository
@@ -119,10 +120,18 @@ class MasterOrchestrator:
         tier = quote.get("tier", "economy")
         execution_id = f"exec_{quote['quote_id']}"
 
-        # 宛先未指定なら登録済みワーカー全員をターゲットにする
-        target_ids = [worker_line_user_id] if worker_line_user_id else [
-            w["line_user_id"] for w in await self.sales_repo.get_active_workers()
-        ]
+        # 宛先未指定の場合の挙動。タイミー実連携が未整備な現時点では、
+        # 登録済みワーカーへの一斉通知ではなく、まずオーナー本人のLINEへテスト送信する
+        # 運用に切り替える(2026-09-15、オーナーの指示によりテスト運用として追加)。
+        # LINE_ADMIN_USER_IDが未設定の場合のみ、従来通り登録済みアクティブワーカーへの
+        # 一斉通知にフォールバックする。
+        admin_line_id = os.environ.get("LINE_ADMIN_USER_ID")
+        if worker_line_user_id:
+            target_ids = [worker_line_user_id]
+        elif admin_line_id:
+            target_ids = [admin_line_id]
+        else:
+            target_ids = [w["line_user_id"] for w in await self.sales_repo.get_active_workers()]
         if not target_ids:
             return {
                 "status": "NO_WORKER_AVAILABLE",
@@ -150,6 +159,11 @@ class MasterOrchestrator:
         })
 
         notification_text = self.line_service.build_task_notification(execution_id, intent, tier)
+        if not worker_line_user_id and admin_line_id:
+            notification_text = (
+                "【タイミー連携テスト運用中: 本来は現場ワーカーへ届く通知です】\n\n"
+                + notification_text
+            )
         push_results = []
         for target_id in target_ids:
             result = await self.line_service.push_message(target_id, notification_text)
