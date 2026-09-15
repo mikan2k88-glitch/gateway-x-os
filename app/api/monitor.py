@@ -255,11 +255,13 @@ async function refresh() {
     );
 
     document.getElementById('cycles').innerHTML = renderTable(
-      data.strategy_cycles, ['状態', 'ラウンド', '判定理由', '日時'],
+      data.strategy_cycles, ['状態', '内容', 'ラウンド', '判定理由', '対応結果', '日時'],
       function(c) {
         return '<td>' + cycleBadge(c.cycle_status) + '</td>' +
+          '<td>' + (c.topic || c.proposal || '-').slice(0, 40) + '</td>' +
           '<td>' + c.round_count + '</td>' +
           '<td>' + (c.executor_reason || '-').slice(0, 60) + '</td>' +
+          '<td>' + (c.outreach_summary || '-') + '</td>' +
           '<td class="mono">' + c.updated_at + '</td>';
       }
     );
