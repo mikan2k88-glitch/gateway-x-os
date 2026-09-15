@@ -138,6 +138,9 @@ async def handle_mcp_tool_call(
     tier = args.get("tier", "express")
     estimated_cost_jpy = args.get("estimated_cost_jpy", 5000)
     client_id = args.get("client_id", "anonymous_ai")
+    # 任意項目。指定されると、営業エンジンがトライアル案内等を実際にPOSTする宛先として
+    # leadsテーブルに保存される(2026-09-14、営業アウトリーチの実送信対応に伴い追加)。
+    callback_url = args.get("callback_url")
 
     # レートリミッター: 海外AIクライアントの無限連打(DoS)を防止する一次防御
     if not rate_limiter.check(client_id, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS):
@@ -154,7 +157,7 @@ async def handle_mcp_tool_call(
     route_info = await orchestrator.auth_gateway.decide_route(client_id, intent, tier)
     if route_info["route"] == "concierge":
         # 初回・非定型パターンの場合はConciergeServiceにリードとして記録させる。
-        await orchestrator.concierge_service.handle_first_contact(client_id, intent, tier)
+        await orchestrator.concierge_service.handle_first_contact(client_id, intent, tier, callback_url=callback_url)
 
     # 0. Tier availability check (tactical は未実装のため拒否)
     tier_check = VettingEngine.check_tier_availability(tier)
