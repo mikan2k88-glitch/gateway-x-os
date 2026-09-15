@@ -445,5 +445,7 @@ class MasterOrchestrator:
             leads = await self.sales_repo.get_leads_by_stage("lead")
             target_client_ids = [lead["client_id"] for lead in leads]
 
-        outreach_result = await self.outreach_service.run_from_strategy_result(result, target_client_ids)
+        outreach_result = await self.outreach_service.run_from_strategy_result(
+            result, target_client_ids, capability_context=capability_context
+        )
         return {**result, "outreach": outreach_result}
