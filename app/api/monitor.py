@@ -141,6 +141,12 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .b-muted { background: rgba(138,144,160,0.15); color: var(--muted); }
   .empty { color: var(--muted); padding: 8px 0; }
   .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; color: var(--muted); }
+  .run-btn {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 6px 14px; font-size: 13px; cursor: pointer; margin-bottom: 10px;
+  }
+  .run-btn:disabled { background: var(--muted); cursor: not-allowed; }
+  .scout-status { margin-left: 10px; font-size: 12px; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -155,6 +161,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   </section>
   <section>
     <h2>営業エンジン(戦略サイクル)</h2>
+    <button id="scoutBtn" class="run-btn" onclick="runOpportunityScout()">案件発掘を今すぐ実行</button>
+    <span id="scoutStatus" class="scout-status"></span>
     <div id="cycles"></div>
   </section>
   <section>
@@ -198,6 +206,32 @@ function renderTable(rows, cols, rowFn) {
   rows.forEach(function(r) { html += '<tr>' + rowFn(r) + '</tr>'; });
   html += '</tbody></table>';
   return html;
+}
+
+async function runOpportunityScout() {
+  var btn = document.getElementById('scoutBtn');
+  var status = document.getElementById('scoutStatus');
+  btn.disabled = true;
+  status.textContent = '案件発掘・討論を実行中... (数十秒かかる場合があります)';
+  try {
+    var res = await fetch('/sales/strategy-cycle', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ skip_feature_detection: true })
+    });
+    var data = await res.json();
+    if (!res.ok) {
+      status.textContent = 'エラー: ' + (data.reason || res.status);
+    } else {
+      var stageLabel = data.stage === 'approved' ? '承認' : data.stage === 'rejected' ? '却下' : '保留';
+      status.textContent = '完了: ' + stageLabel + ' (cycle_id=' + data.cycle_id + ')';
+    }
+  } catch (e) {
+    status.textContent = '通信エラー: ' + e;
+  }
+  btn.disabled = false;
+  refresh();
 }
 
 async function refresh() {
