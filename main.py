@@ -278,13 +278,13 @@ async def handle_execute(request: ExecuteRequest):
     /mcp/v1/tools/call が返した見積(quote)を受け取り、決済(Auth)を行う。
 
     worker_line_user_id が指定されている場合: そのワーカー1人にLINE通知(個別指定)。
-    worker_line_user_id が無いが登録済みワーカーがいる場合: 登録済み全員に一斉通知(早い者勝ち)。
+    worker_line_user_id が無い場合: dispatch_to_worker内で
+    LINE_ADMIN_USER_ID(オーナー、タイミー実連携までのテスト運用) → 登録済み全ワーカーへの
+    一斉通知、の優先順で宛先を決める(2026-09-15、レガシーの同期実行パスへの誤フォール
+    バックを修正)。
     どちらの場合も status: "DISPATCHED" を返し、Captureは後でLINE Webhook経由で非同期に行われる。
     クライアントAIは返ってきた execution_id で GET /mcp/v1/tools/execute/{execution_id}
     をポーリングして進捗を確認できる。
-
-    worker_line_user_id が無く、登録済みワーカーも1人もいない場合: レガシーの同期実行パス
-    (execute_physical_task、プレ検収は固定で合格扱い)にフォールバックする。
     """
     if request.quote.get("channel") == "digital":
         # デジタルタスクはタイミーワーカーへのLINE通知を経由せず、
@@ -294,24 +294,11 @@ async def handle_execute(request: ExecuteRequest):
             quote=request.quote,
             payment_method_id=request.payment_method_id,
         )
-    elif request.worker_line_user_id:
+    else:
         result = await orchestrator.dispatch_to_worker(
             client_id=request.client_id,
             quote=request.quote,
             worker_line_user_id=request.worker_line_user_id,
-            payment_method_id=request.payment_method_id,
-        )
-    elif await orchestrator.sales_repo.get_active_workers():
-        result = await orchestrator.dispatch_to_worker(
-            client_id=request.client_id,
-            quote=request.quote,
-            worker_line_user_id=None,
-            payment_method_id=request.payment_method_id,
-        )
-    else:
-        result = await orchestrator.execute_physical_task(
-            client_id=request.client_id,
-            quote=request.quote,
             payment_method_id=request.payment_method_id,
         )
     return result
