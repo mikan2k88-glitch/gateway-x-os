@@ -43,13 +43,18 @@ class ConciergeService:
         self.latest_cycle_status: Optional[Dict[str, Any]] = None
 
     async def handle_first_contact(
-        self, client_id: str, intent: str, tier: str, source: str = "auto_routed"
+        self, client_id: str, intent: str, tier: str, source: str = "auto_routed",
+        callback_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         existing = await self.sales_repo.get_account(client_id)
         if existing is None:
             await self.sales_repo.create_lead(
-                client_id, source=source, notes=f"初回問い合わせ: intent={intent}, tier={tier}"
+                client_id, source=source, notes=f"初回問い合わせ: intent={intent}, tier={tier}",
+                callback_url=callback_url or "",
             )
+        elif callback_url:
+            # 既存リードでも、後からcallback_urlを教えてもらえた場合は反映する。
+            await self.sales_repo.update_lead_callback_url(client_id, callback_url)
         message = (
             "初めてのご依頼、ありがとうございます。今回はコンシェルジュ経由でご案内しています。"
             "内容を確認のうえ通常フローで見積を発行します。"
