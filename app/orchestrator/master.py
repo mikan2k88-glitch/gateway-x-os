@@ -453,6 +453,9 @@ class MasterOrchestrator:
         self.concierge_service.record_cycle_result(result)
 
         if result["stage"] != "approved":
+            await self.sales_repo.update_cycle_outreach_summary(
+                result["cycle_id"], f"{result['stage']}のため対応なし"
+            )
             return {**result, "outreach": None}
 
         if target_client_ids is None:
@@ -462,4 +465,20 @@ class MasterOrchestrator:
         outreach_result = await self.outreach_service.run_from_strategy_result(
             result, target_client_ids, capability_context=capability_context
         )
+
+        # ダッシュボードで「承認後どう対応したか」まで見えるよう、結果概要を記録する。
+        delivered_count = sum(
+            1 for r in outreach_result
+            if r.get("action") == "trial_invited" and r.get("delivery", {}).get("delivered")
+        )
+        recorded_only_count = sum(
+            1 for r in outreach_result
+            if r.get("action") == "trial_invited" and r.get("delivery") == "recorded_only"
+        )
+        outreach_summary = (
+            f"{len(outreach_result)}件へトライアル案内(実送信{delivered_count}件 / "
+            f"記録のみ{recorded_only_count}件、callback_url未登録のため)"
+        )
+        await self.sales_repo.update_cycle_outreach_summary(result["cycle_id"], outreach_summary)
+
         return {**result, "outreach": outreach_result}
