@@ -100,6 +100,7 @@ class SalesRepository:
             cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS strategy_cycles (
                 id {id_pk},
+                topic TEXT,
                 cycle_status TEXT DEFAULT 'debating',
                 round_count INTEGER DEFAULT 0,
                 proposal TEXT,
@@ -107,10 +108,24 @@ class SalesRepository:
                 revision TEXT,
                 executor_decision TEXT,
                 executor_reason TEXT,
+                outreach_summary TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """)
+            # 既存(稼働中)のstrategy_cyclesテーブルには無い可能性があるため、マイグレーションで補う。
+            if pg:
+                cursor.execute("ALTER TABLE strategy_cycles ADD COLUMN IF NOT EXISTS topic TEXT")
+                cursor.execute("ALTER TABLE strategy_cycles ADD COLUMN IF NOT EXISTS outreach_summary TEXT")
+            else:
+                for stmt in (
+                    "ALTER TABLE strategy_cycles ADD COLUMN topic TEXT",
+                    "ALTER TABLE strategy_cycles ADD COLUMN outreach_summary TEXT",
+                ):
+                    try:
+                        cursor.execute(stmt)
+                    except sqlite3.OperationalError:
+                        pass  # 既に列が存在する場合はスキップ
 
             cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS capacity_alerts (
@@ -285,25 +300,38 @@ class SalesRepository:
 
     # ---------- strategy_cycles / Planner <-> Executor ----------
 
-    async def start_strategy_cycle(self, proposal: str) -> int:
+    async def start_strategy_cycle(self, proposal: str, topic: str = "") -> int:
         def _execute():
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 if self.use_postgres:
                     cursor.execute("""
-                    INSERT INTO strategy_cycles (cycle_status, round_count, proposal)
-                    VALUES ('debating', 1, %s) RETURNING id
-                    """, (proposal,))
+                    INSERT INTO strategy_cycles (topic, cycle_status, round_count, proposal)
+                    VALUES (%s, 'debating', 1, %s) RETURNING id
+                    """, (topic, proposal))
                     new_id = cursor.fetchone()["id"]
                 else:
                     cursor.execute("""
-                    INSERT INTO strategy_cycles (cycle_status, round_count, proposal)
-                    VALUES ('debating', 1, ?)
-                    """, (proposal,))
+                    INSERT INTO strategy_cycles (topic, cycle_status, round_count, proposal)
+                    VALUES (?, 'debating', 1, ?)
+                    """, (topic, proposal))
                     new_id = cursor.lastrowid
                 conn.commit()
                 return new_id
         return await asyncio.to_thread(_execute)
+
+    async def update_cycle_outreach_summary(self, cycle_id: int, summary: str) -> None:
+        """承認後にOutreachServiceが行った対応(何件へ案内し、実送信できたか等)を記録する"""
+        def _execute():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                ph = "%s" if self.use_postgres else "?"
+                cursor.execute(f"""
+                UPDATE strategy_cycles SET outreach_summary = {ph}, updated_at = CURRENT_TIMESTAMP
+                WHERE id = {ph}
+                """, (summary, cycle_id))
+                conn.commit()
+        await asyncio.to_thread(_execute)
 
     async def update_debate_round(
         self, cycle_id: int, round_count: int, critique: str, revision: str
