@@ -21,9 +21,11 @@ All requests undergo real-time Economic Security Vetting, Dynamic Pricing (USD-d
 
 ## 2. Authentication & Rate Limits
 
-- **Header:** `Authorization: Bearer <YOUR_GATEWAY_X_API_KEY>`
+- **Header:** `Authorization: Bearer <YOUR_GATEWAY_X_API_KEY>` (required only when the operator has
+  configured `GATEWAY_X_API_KEYS`; unauthenticated access is currently allowed by default while in
+  test operation)
 - **Content-Type:** `application/json`
-- **Rate Limit:** 5 requests per hour per client ID (DoS / runaway agent protection)
+- **Rate Limit:** 20 requests per 60 seconds per client ID (DoS / runaway agent protection)
 
 ---
 
