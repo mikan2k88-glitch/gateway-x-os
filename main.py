@@ -1,7 +1,7 @@
 import os
 import logging
 import uvicorn
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
@@ -74,6 +74,25 @@ async def gemini_client_error_handler(request, exc: genai_errors.ClientError):
 
 vetting_engine = VettingEngine()
 semantic_capability_reviewer = SemanticCapabilityReviewer()
+
+# APIキー認証: README記載の "Authorization: Bearer <YOUR_GATEWAY_X_API_KEY>" が
+# これまで一切検証されておらず、無認証で/mcp/v1/tools/call・/executeを叩けてしまう
+# 状態だったため追加(2026-09-15)。GATEWAY_X_API_KEYS未設定の場合は現状の挙動を
+# 維持し無認証で通す(Company X等、既存クライアントとの後方互換のため)。
+# 有効なキーをカンマ区切りで設定すると、以後は必須になる(フェイルクローズ)。
+_valid_api_keys = {
+    k.strip() for k in os.environ.get("GATEWAY_X_API_KEYS", "").split(",") if k.strip()
+}
+
+
+async def verify_api_key(authorization: Optional[str] = Header(None)) -> None:
+    if not _valid_api_keys:
+        return  # 未設定の間は無認証を許可(後方互換)
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
+    token = authorization[len("Bearer "):].strip()
+    if token not in _valid_api_keys:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 pricing_engine = PricingEngine()
 orchestrator = MasterOrchestrator()
 rate_limiter = RateLimiter()
@@ -128,7 +147,8 @@ async def root():
 @app.post("/mcp/v1/tools/call")
 async def handle_mcp_tool_call(
     request: MCPToolCallRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    _: None = Depends(verify_api_key),
 ):
     if request.name != "dispatch_physical_execution":
         raise HTTPException(status_code=400, detail=f"Unknown tool name: {request.name}")
@@ -273,7 +293,7 @@ async def handle_mcp_tool_call(
 
 
 @app.post("/mcp/v1/tools/execute")
-async def handle_execute(request: ExecuteRequest):
+async def handle_execute(request: ExecuteRequest, _: None = Depends(verify_api_key)):
     """
     /mcp/v1/tools/call が返した見積(quote)を受け取り、決済(Auth)を行う。
 
